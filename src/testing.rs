@@ -31,6 +31,8 @@ use anyhow::{Context, Result};
 
 use crate::net::Fetcher;
 
+pub mod fake;
+
 /// Point `host` at `addr` for `fetcher`, bypassing DNS **and** the forbidden-IP
 /// check for that host only, and make `fetcher` trust the test CA
 /// ([`test_pki`]).
@@ -277,6 +279,71 @@ pub(crate) async fn spawn_tls_with_leaf<F>(
 where
     F: FnOnce(SocketAddr) -> HashMap<String, Vec<TestResponse>>,
 {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    let addr = serve_tls(leaf, move |addr| {
+        // Routes are built from the bound address: the documents have to name
+        // their own port, and the port is not known until the listener exists.
+        let routes = build_routes(addr);
+        let hits: Mutex<HashMap<String, usize>> = Default::default();
+        Arc::new(move |req: &str| {
+            let path = req
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("/")
+                .to_string();
+            sink.lock().unwrap().push(req.to_string());
+            // Nth hit on this path picks the Nth canned reply; the last one
+            // repeats. That is what lets a route answer a nonce challenge
+            // once and something else afterwards — the only way to observe
+            // whether a request was RETRIED.
+            let n = {
+                let mut c = hits.lock().unwrap();
+                let e = c.entry(path.clone()).or_insert(0usize);
+                let n = *e;
+                *e += 1;
+                n
+            };
+            let reply = routes
+                .get(&path)
+                .and_then(|v| v.get(n.min(v.len().saturating_sub(1))))
+                .cloned()
+                .unwrap_or_else(|| TestResponse::json(404, "not found"));
+            Served {
+                status: reply.status,
+                content_type: "application/json".into(),
+                headers: reply.headers,
+                body: reply.body.into_bytes(),
+                delay: None,
+            }
+        })
+    })
+    .await;
+    (addr, log)
+}
+
+/// One reply from [`serve_tls`]'s handler.
+pub(crate) struct Served {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    /// Wait this long before answering (a slow or hanging server).
+    pub(crate) delay: Option<std::time::Duration>,
+}
+
+/// What [`serve_tls`] asks about each request: the raw request (head, and the
+/// body when `content-length` gives its length) in, the reply out.
+pub(crate) type Handler = Arc<dyn Fn(&str) -> Served + Send + Sync>;
+
+/// A loopback HTTPS server presenting `leaf`, answering every request (one per
+/// connection, `Connection: close`) with the handler `make` builds from the
+/// bound address. The engine under [`spawn_tls`] and the stateful [`fake`].
+pub(crate) async fn serve_tls<M>(leaf: TestLeaf, make: M) -> SocketAddr
+where
+    M: FnOnce(SocketAddr) -> Handler,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -313,12 +380,7 @@ where
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    // Routes are built from the bound address: the documents have to name their
-    // own port, and the port is not known until the listener exists.
-    let routes = build_routes(addr);
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&log);
-    let hits: Arc<Mutex<HashMap<String, usize>>> = Default::default();
+    let handler = make(addr);
 
     tokio::spawn(async move {
         loop {
@@ -326,9 +388,7 @@ where
                 break;
             };
             let acceptor = acceptor.clone();
-            let routes = routes.clone();
-            let sink = Arc::clone(&sink);
-            let hits = Arc::clone(&hits);
+            let handler = Arc::clone(&handler);
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(sock).await else {
                     return;
@@ -374,46 +434,29 @@ where
                     }
                 }
                 let req = String::from_utf8_lossy(&raw).to_string();
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("/")
-                    .to_string();
-                sink.lock().unwrap().push(req);
-                // Nth hit on this path picks the Nth canned reply; the last one
-                // repeats. That is what lets a route answer a nonce challenge
-                // once and something else afterwards — the only way to observe
-                // whether a request was RETRIED.
-                let n = {
-                    let mut c = hits.lock().unwrap();
-                    let e = c.entry(path.clone()).or_insert(0usize);
-                    let n = *e;
-                    *e += 1;
-                    n
-                };
-                let reply = routes
-                    .get(&path)
-                    .and_then(|v| v.get(n.min(v.len().saturating_sub(1))))
-                    .cloned()
-                    .unwrap_or_else(|| TestResponse::json(404, "not found"));
+                let reply = handler(&req);
+                if let Some(delay) = reply.delay {
+                    tokio::time::sleep(delay).await;
+                }
                 let extra: String = reply
                     .headers
                     .iter()
                     .map(|(k, v)| format!("{k}: {v}\r\n"))
                     .collect();
-                let (status, body) = (reply.status, reply.body);
-                let resp = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                let head = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\n{extra}\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.status,
+                    reply.content_type,
+                    reply.body.len()
                 );
-                let _ = tls.write_all(resp.as_bytes()).await;
+                let _ = tls.write_all(head.as_bytes()).await;
+                let _ = tls.write_all(&reply.body).await;
                 let _ = tls.shutdown().await;
             });
         }
     });
-    (addr, log)
+    addr
 }
 
 fn pem_certs(pem: &[u8]) -> Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>> {

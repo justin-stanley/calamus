@@ -73,3 +73,30 @@ test-util = ["dep:rcgen", "dep:tokio-rustls", "tokio/io-util", "tokio/macros", "
 
 [lints.rust]
 unsafe_code = "forbid"
+
+# The end-to-end suites run against `calamus::testing::fake` (the fake
+# authorization server, PDS, PLC directory and DNS), so they need `test-util`;
+# `scripts/ci.sh` runs them with every feature on. None touches the network.
+[[test]]
+name = "e2e_login"
+required-features = ["test-util"]
+
+[[test]]
+name = "e2e_identity_only"
+required-features = ["test-util"]
+
+[[test]]
+name = "e2e_refresh"
+required-features = ["test-util"]
+
+[[test]]
+name = "e2e_revoke"
+required-features = ["test-util", "revoke"]
+
+[[test]]
+name = "e2e_xrpc"
+required-features = ["test-util", "xrpc"]
+
+[[test]]
+name = "e2e_proof_replay"
+required-features = ["test-util"]

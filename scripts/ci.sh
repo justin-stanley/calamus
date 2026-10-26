@@ -9,6 +9,16 @@ case "$target" in "$PWD"/target) ;; *) echo "target dir is $target, not $PWD/tar
 cargo fmt --all --check
 cargo build --all-targets --all-features --locked
 cargo test --all-features --locked
+# That run includes the end-to-end suites (tests/e2e_*.rs, against
+# calamus::testing::fake). They need no network: every host they reach is a host
+# override onto the fake's loopback listener, and DNS is a static table. A suite
+# whose `required-features` stopped matching would be skipped without a word, so
+# each must be a target that lists tests with every feature on.
+for suite in tests/e2e_*.rs; do
+  name=$(basename "$suite" .rs)
+  n=$(cargo test --all-features --locked --quiet --test "$name" -- --list 2>/dev/null | grep -c ': test$' || true)
+  if [ "$n" -eq 0 ]; then echo "ci: $name has no tests with --all-features"; exit 1; fi
+done
 cargo clippy --all-targets --all-features -- -D warnings
 # And with no optional features at all (no `dns`, no `revoke`, no `test-util`):
 # the core revocation request and the refresh path that needs it are always

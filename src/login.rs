@@ -189,6 +189,7 @@ impl Client {
             |req: ParPost| async move {
                 post_form(fetcher, nonces, &req.url, &req.key, &req.params, req.retry, req.clock)
                     .await
+                    .map(|(outcome, _minted_at)| outcome)
             },
         )
         .await
@@ -543,7 +544,8 @@ where
     D: Fn(Discovery) -> DFut,
     DFut: Future<Output = Result<AuthorizationServer>>,
     P: Fn(TokenPost) -> PFut,
-    PFut: Future<Output = Result<PostOutcome>>,
+    // The outcome, and when the proof that got it was minted.
+    PFut: Future<Output = Result<(PostOutcome, i64)>>,
     R: Fn(String) -> RFut,
     RFut: Future<Output = Result<ResolvedAccount>>,
 {
@@ -628,7 +630,7 @@ where
         (e.method, e.assertion_type.map(str::to_owned))
     };
 
-    let outcome = post(TokenPost {
+    let (outcome, minted_at) = post(TokenPost {
         url: server.token_endpoint.clone(),
         params: token_params,
         key: Arc::clone(&key),
@@ -650,8 +652,11 @@ where
         outcome.status,
     );
 
-    // The `sub` check, then the store.
-    let session = accept_token_response(sessions, &pending, &outcome, clock.now()).await?;
+    // The `sub` check, then the store. The expiry counts from when the proof
+    // that got this response was minted, before the request went out: the
+    // server issued the token no earlier, so the stored expiry errs early (a
+    // refresh a little soon), never late. As `apply_refresh` does.
+    let session = accept_token_response(sessions, &pending, &outcome, minted_at).await?;
     let did = session.sub.clone();
 
     // The handle is resolved from the DID rather than remembered from the login
@@ -732,6 +737,9 @@ fn token_exchange_params(
 /// **Split out of `complete` so these checks are reachable without a live
 /// authorization server.** The body is parsed only after the status check — a
 /// failed exchange must not have its body examined or echoed.
+///
+/// `now` is what `expires_in` counts from: the time the token request's proof
+/// was minted, as for [`crate::session::apply_refresh`].
 async fn accept_token_response(
     sessions: &impl SessionStore,
     pending: &PendingLogin,
@@ -792,7 +800,8 @@ fn client_assertion(
     }
 }
 
-/// POST a form to an authorization-server endpoint with a DPoP proof.
+/// POST a form to an authorization-server endpoint with a DPoP proof. Also
+/// returns when the proof that got the final response was minted.
 async fn post_form(
     fetcher: &Fetcher,
     nonces: &impl NonceStore,
@@ -801,9 +810,9 @@ async fn post_form(
     params: &[(&'static str, String)],
     retry: Retry,
     clock: crate::Elapsing,
-) -> Result<PostOutcome> {
+) -> Result<(PostOutcome, i64)> {
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let (outcome, _) = request::send_with_dpop_at(
+    request::send_with_dpop_at(
         fetcher,
         nonces,
         &request::DpopRequest {
@@ -816,8 +825,7 @@ async fn post_form(
         },
         clock,
     )
-    .await?;
-    Ok(outcome)
+    .await
 }
 
 #[cfg(test)]
@@ -1942,10 +1950,11 @@ mod tests {
                         dpop_thumbprint: tp,
                         retry: req.retry,
                     });
-                    Ok(PostOutcome {
+                    let outcome = PostOutcome {
                         status: token_status,
                         body,
-                    })
+                    };
+                    Ok((outcome, req.clock.now()))
                 }
             },
             move |did| {
@@ -3184,7 +3193,7 @@ mod tests {
                 let body = body.clone();
                 async move {
                     sink.lock().unwrap().push(req.params);
-                    Ok(PostOutcome { status: 200, body })
+                    Ok((PostOutcome { status: 200, body }, req.clock.now()))
                 }
             },
             |_did| async move { Err(anyhow::anyhow!("offline")) },
@@ -3282,6 +3291,67 @@ mod tests {
         );
     }
 
+    /// **The session's expiry counts from when the token proof was minted.**
+    ///
+    /// The token response offers a nonce whose store takes 60 s: anchored after
+    /// the response, the expiry said NOW+3600+60, a minute later than the
+    /// server can have meant. The refresh has counted from the proof's mint
+    /// time since 8890b76; the login is the same rule.
+    #[tokio::test]
+    async fn a_session_expiry_counts_from_the_token_proofs_mint_time() {
+        let cookie = flow::new_binding_token();
+        let (addr, _log) = spawn_tls(|addr| {
+            let port = addr.port();
+            let mut r = discovery_routes(
+                &format!("https://pds-e2e.test:{port}"),
+                &format!("https://as-e2e.test:{port}"),
+            );
+            r.insert(
+                "/token".to_string(),
+                vec![TestResponse::json(200, token_body(PENDING_DID).to_string())
+                    .with_header("DPoP-Nonce", "after")],
+            );
+            r
+        })
+        .await;
+        let fetcher = Fetcher::default();
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            test_host_override(&fetcher, h, addr);
+        }
+        let port = addr.port();
+        let issuer = format!("https://as-e2e.test:{port}");
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.pds_url = format!("https://pds-e2e.test:{port}");
+        pending.issuer = issuer.clone();
+        let stores = Stores::default();
+        stores.pending.put(&pending).await.unwrap();
+        let nonces = crate::testing::slow::SlowNonces {
+            on_put: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        let dns = StaticDns::new();
+        let deps = Deps {
+            fetcher: &fetcher,
+            dns: &dns,
+            pending: &stores.pending,
+            sessions: &stores.sessions,
+            nonces: &nonces,
+        };
+        let mut params = callback_params();
+        params.iss = Some(issuer);
+
+        let done = client_at("https://feather-reader.com")
+            .complete(&deps, &params, Some(&cookie), NOW)
+            .await
+            .expect("the login completes");
+        let expires_at = done.session.expires_at.unwrap();
+        assert!(
+            (NOW + 3600..NOW + 3603).contains(&expires_at),
+            "the expiry was anchored after the response: NOW+3600{:+}",
+            expires_at - NOW - 3600
+        );
+    }
+
     /// Two confidential clients with ONE redirect and different `client_id`s:
     /// the redirect comparison cannot tell them apart.
     fn client_with_id(client_id: &str) -> Client {
@@ -3339,9 +3409,10 @@ mod tests {
                     *d.lock().unwrap() += 1;
                     async move { Ok(started_server()) }
                 },
-                move |_req: TokenPost| {
+                move |req: TokenPost| {
                     *p.lock().unwrap() += 1;
-                    async move { Ok(outcome(400, &serde_json::json!({"error": "invalid_grant"}))) }
+                    let invalid = outcome(400, &serde_json::json!({"error": "invalid_grant"}));
+                    async move { Ok((invalid, req.clock.now())) }
                 },
                 |_did| async move { Err(anyhow::anyhow!("offline")) },
             )
