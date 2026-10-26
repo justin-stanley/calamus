@@ -11,6 +11,8 @@ cargo build --all-targets --all-features --locked
 cargo test --all-features --locked
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
+# And with default features: a link to a feature-gated item breaks only there.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 cargo deny check bans licenses sources
 cargo audit -D warnings
 echo "ci: all green"
