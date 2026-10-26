@@ -142,7 +142,7 @@ pub fn client_assertion(
             "aud": issuer,
             "jti": URL_SAFE_NO_PAD.encode(jti),
             "iat": now,
-            "exp": now + ASSERTION_LIFETIME_SECS,
+            "exp": now.saturating_add(ASSERTION_LIFETIME_SECS),
         }),
     )
 }

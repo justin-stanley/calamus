@@ -220,3 +220,108 @@ async fn concurrent_refreshes_of_one_subject_make_one_token_request() {
     assert_eq!(refreshes, 1, "one refresh request");
     assert!(w.fake.rejections().is_empty(), "{:?}", w.fake.rejections());
 }
+
+/// **An absurd clock saturates the whole way through.** A `private_key_jwt`
+/// login and then `valid_session` at `now = i64::MAX - 10`: every `now + secs`
+/// (the pending row's expiry, the session's expiry, the client assertion's
+/// `exp`, the staleness margin) saturates rather than panicking in a debug
+/// build (or wrapping to the past in release). The stored expiry saturates at
+/// `i64::MAX`, which the margin still counts as stale, so the session is
+/// refreshed.
+#[tokio::test]
+async fn an_absurd_clock_saturates_through_login_and_valid_session() {
+    const ABSURD: i64 = i64::MAX - 10;
+    let w = World::new().await;
+    assert_eq!(
+        w.client.auth_method(),
+        calamus::client_auth::AuthMethod::PrivateKeyJwt,
+        "precondition: the assertion path is exercised"
+    );
+    let started = w
+        .client
+        .start(&w.deps(), calamus::testing::fake::HANDLE, ABSURD)
+        .await
+        .expect("the login starts");
+    let params = w.fake.approve(&started.authorize_url).unwrap();
+    let login = w
+        .client
+        .complete(&w.deps(), &params, Some(&started.binding_token), ABSURD)
+        .await
+        .expect("the login completes");
+    assert_eq!(login.session.expires_at, Some(i64::MAX));
+
+    let server = w.discover_for(&login.session).await.unwrap();
+    let fresh = valid_session(
+        &w.sessions,
+        &w.fetcher,
+        &w.nonces,
+        &RefreshLocks::default(),
+        &login.did,
+        &w.refresh_context(&server),
+        ABSURD,
+    )
+    .await
+    .expect("valid_session at an absurd clock");
+    assert_eq!(fresh.expires_at, Some(i64::MAX));
+    assert_eq!(w.fake.issued().len(), 2, "the login, then the refresh");
+    assert!(w.fake.rejections().is_empty(), "{:?}", w.fake.rejections());
+}
+
+/// **A refresh context carries the issuer of the discovery its endpoints came
+/// from.** A caller that discovers without expecting the session's issuer,
+/// after the PDS has been repointed, gets the new server: built with
+/// `RefreshContext::new`, the context's issuer IS that server's, so the
+/// refresh refuses the stored grant (another issuer's) before any request.
+/// The old misuse (the new server's endpoints with the row's issuer, which
+/// passed the check and sent the refresh token to whatever server the PDS
+/// named) cannot be written: the fields are private.
+#[tokio::test]
+async fn a_context_from_a_discovery_at_another_issuer_refuses_before_any_request() {
+    let w = World::new().await;
+    let login = w.login().await;
+    w.fake.point_pds_at(OTHER_AS_HOST);
+    let moved = calamus::discovery::discover(
+        &w.fetcher,
+        &login.session.aud,
+        w.client.auth_method().as_str(),
+        None,
+    )
+    .await
+    .expect("the moved server's own metadata is consistent");
+    let ctx = calamus::session::RefreshContext::new(&moved, &w.client);
+    assert_eq!(ctx.issuer(), moved.issuer);
+    assert_eq!(ctx.token_endpoint(), moved.token_endpoint);
+    assert_eq!(
+        ctx.revocation_endpoint(),
+        moved.revocation_endpoint.as_deref()
+    );
+
+    let err = valid_session(
+        &w.sessions,
+        &w.fetcher,
+        &w.nonces,
+        &RefreshLocks::default(),
+        &login.did,
+        &ctx,
+        LATER,
+    )
+    .await
+    .expect_err("another issuer's context must be refused");
+    match calamus::Error::find(&err) {
+        Some(calamus::Error::Discovery(calamus::error::DiscoveryError::IssuerMismatch {
+            discovered,
+            expected,
+            ..
+        })) => {
+            assert_eq!(discovered, &moved.issuer);
+            assert_eq!(expected, &login.session.issuer);
+        }
+        other => panic!("{other:?}: {err:#}"),
+    }
+    assert_eq!(w.fake.count(OTHER_AS_HOST, "/token"), 0);
+    assert_eq!(w.fake.count(AS_HOST, "/token"), 1, "only the login's");
+    assert_eq!(
+        w.sessions.get(&login.did).await.unwrap(),
+        Some(login.session)
+    );
+}

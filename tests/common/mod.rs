@@ -112,14 +112,7 @@ impl World {
 
     /// A refresh context for `server`.
     pub fn refresh_context<'a>(&'a self, server: &'a AuthorizationServer) -> RefreshContext<'a> {
-        RefreshContext {
-            token_endpoint: &server.token_endpoint,
-            client_id: self.client.client_id(),
-            auth_method: self.client.auth_method(),
-            client_key: self.client.key(),
-            revocation_endpoint: server.revocation_endpoint.as_deref(),
-            issuer: &server.issuer,
-        }
+        RefreshContext::new(server, &self.client)
     }
 }
 

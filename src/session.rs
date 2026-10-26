@@ -26,9 +26,11 @@ use anyhow::Result;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::client_auth::{self, AuthMethod};
+use crate::discovery::AuthorizationServer;
 use crate::dpop::Endpoint;
-use crate::error::{Grant, SessionGone, TokenError};
+use crate::error::{DiscoveryError, Grant, SessionGone, TokenError};
 use crate::keys::SigningKey;
+use crate::login::Client;
 use crate::net::Fetcher;
 use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
 use crate::revoke::{self, Revocation, RevokeContext};
@@ -182,40 +184,113 @@ impl RefreshLocks {
     }
 }
 
-/// What a refresh needs beyond the session itself.
+/// What a refresh needs beyond the session itself: one authorization
+/// server's endpoints, the issuer they were discovered for, and this client's
+/// credentials.
 ///
-/// `token_endpoint` and `revocation_endpoint` must come from a discovery of
-/// `issuer`, and `issuer` must be the session's own ([`same_issuer`] is checked
-/// again before the request): this path sends the REFRESH TOKEN.
+/// **Built only from an [`AuthorizationServer`]**, so the issuer and the
+/// endpoints come from the SAME discovery ([`RefreshContext::new`],
+/// [`RefreshContext::with_auth`]). The refresh compares that issuer with the
+/// stored row's ([`same_issuer`]) before anything is sent: this path sends
+/// the REFRESH TOKEN. With public fields, a caller could pair one discovery's
+/// endpoints with the row's own issuer (`discover(.., &row.aud, .., None)`,
+/// then `issuer: &row.issuer`), which passes that check every time and sends
+/// the refresh token to whatever authorization server the PDS names now.
+///
+/// Discover for the session's issuer
+/// ([`crate::discovery::discover`] with `Some(&session.issuer)`): a PDS that
+/// names another server is then refused by discovery itself. A context from
+/// a discovery without an expected issuer is still safe, as its issuer is the
+/// server it found, and a row that is not that server's is refused by the
+/// refresh (as [`crate::error::DiscoveryError::IssuerMismatch`], or
+/// [`crate::error::DiscoveryError::StoredIssuerChanged`] when the row was
+/// re-logged at another server during the call).
+///
+/// The fields cannot be set by hand outside calamus:
+///
+/// ```compile_fail
+/// let ctx = calamus::session::RefreshContext {
+///     token_endpoint: "https://as.example/token",
+///     client_id: "https://app.example/client-metadata.json",
+///     auth_method: calamus::client_auth::AuthMethod::None,
+///     client_key: None,
+///     revocation_endpoint: None,
+///     issuer: "https://as.example",
+/// };
+/// ```
+#[derive(Clone, Copy)]
 pub struct RefreshContext<'a> {
     /// The authorization server's token endpoint.
-    pub token_endpoint: &'a str,
+    pub(crate) token_endpoint: &'a str,
     /// This client's `client_id`.
-    pub client_id: &'a str,
+    pub(crate) client_id: &'a str,
     /// How this client authenticates.
-    pub auth_method: AuthMethod,
+    pub(crate) auth_method: AuthMethod,
     /// The confidential client's signing key. Required for `private_key_jwt`,
     /// unused by the localhost dev client.
-    pub client_key: Option<&'a SigningKey>,
+    pub(crate) client_key: Option<&'a SigningKey>,
     /// From the same discovery as `token_endpoint`. Used only when a refresh
     /// finds its session was signed out while it ran: the tokens it just
     /// obtained belong to no one, and are revoked rather than left live.
-    pub revocation_endpoint: Option<&'a str>,
+    pub(crate) revocation_endpoint: Option<&'a str>,
     /// The authorization server `token_endpoint` and `revocation_endpoint` were
-    /// discovered for. A session whose issuer is any other is refused before
-    /// anything is sent ([`same_issuer`]).
-    ///
-    /// **Set it to the issuer you ran discovery FOR**, which is usually the
-    /// `issuer` of your own earlier read of this session (the endpoints are not
-    /// stored on it, so you read it, discovered for its issuer, and built this
-    /// context). That is not checking a value against itself: the refresh
-    /// re-reads the row under its lock, and the row it then holds can be a
-    /// different grant from the one you read (a re-login, after a PDS
-    /// migration, at another authorization server). The check compares the
-    /// issuer your ENDPOINTS belong to with the issuer of the row whose refresh
-    /// token is about to be sent, so the token never goes to a server that
-    /// did not issue it.
-    pub issuer: &'a str,
+    /// discovered for.
+    pub(crate) issuer: &'a str,
+}
+
+impl<'a> RefreshContext<'a> {
+    /// A context for refreshing at `server`, as `client`.
+    pub fn new(server: &'a AuthorizationServer, client: &'a Client) -> Self {
+        Self::with_auth(
+            server,
+            client.client_id(),
+            client.auth_method(),
+            client.key(),
+        )
+    }
+
+    /// A context for refreshing at `server`, with the client's credentials
+    /// given piecewise (for a caller without a [`Client`]).
+    pub fn with_auth(
+        server: &'a AuthorizationServer,
+        client_id: &'a str,
+        auth_method: AuthMethod,
+        client_key: Option<&'a SigningKey>,
+    ) -> Self {
+        Self {
+            token_endpoint: &server.token_endpoint,
+            client_id,
+            auth_method,
+            client_key,
+            revocation_endpoint: server.revocation_endpoint.as_deref(),
+            issuer: &server.issuer,
+        }
+    }
+
+    /// The issuer the endpoints were discovered for.
+    pub fn issuer(&self) -> &'a str {
+        self.issuer
+    }
+
+    /// The token endpoint.
+    pub fn token_endpoint(&self) -> &'a str {
+        self.token_endpoint
+    }
+
+    /// The revocation endpoint, if the server advertises one.
+    pub fn revocation_endpoint(&self) -> Option<&'a str> {
+        self.revocation_endpoint
+    }
+
+    /// This client's `client_id`.
+    pub fn client_id(&self) -> &'a str {
+        self.client_id
+    }
+
+    /// How this client authenticates.
+    pub fn auth_method(&self) -> AuthMethod {
+        self.auth_method
+    }
 }
 
 /// Read a session, refreshing it first if it is close to expiry. `now` is Unix
@@ -256,12 +331,25 @@ pub async fn valid_session(
 
     // Re-read AFTER acquiring the lock: whoever held it may have refreshed while
     // we waited, and presenting the token they just replaced would burn it.
+    let first_issuer = session.issuer;
     let (session, version) = store
         .get_versioned(sub)
         .await?
         .ok_or_else(|| no_session(sub, SessionGone::WhileWaitingToRefresh))?;
     if !token::is_stale(session.expires_at, now) {
         return Ok(session);
+    }
+    // The row read before the lock was at the context's issuer, and the one
+    // read under it is not: the ROW moved (a re-login at another
+    // authorization server), not the PDS. Say so, so the caller re-reads and
+    // rediscovers rather than treating it as a mix-up. `refresh_locked`
+    // refuses every other mismatch as `IssuerMismatch`.
+    if session.issuer != ctx.issuer && first_issuer == ctx.issuer {
+        return Err(crate::Error::from(DiscoveryError::StoredIssuerChanged {
+            stored: session.issuer,
+            expected: ctx.issuer.to_string(),
+        })
+        .into());
     }
 
     refresh_locked(store, fetcher, nonces, &session, &version, ctx, clock).await
@@ -280,8 +368,8 @@ pub async fn valid_session(
 ///   token at a ROTATING server: refresh tokens are single-use, and ours
 ///   succeeded. So our tokens belong to the old grant, which nothing
 ///   references any more. At a server that does NOT rotate, it can be another
-///   process's refresh of the same grant, which is why the refresh token we
-///   started from is never revoked here.
+///   process's refresh of the same grant, which is why no token the row on
+///   record holds (there, the refresh token we started from) is revoked.
 /// * **Gone**: it was signed out while we refreshed. We now hold a live token
 ///   set for a session that no longer exists, and the caller gets the same
 ///   "no session" error a signed-out user gets.
@@ -303,12 +391,11 @@ async fn lost_the_row(
     fetcher: &Fetcher,
     nonces: &impl NonceStore,
     ctx: &RefreshContext<'_>,
-    from: &Session,
     obtained: &Session,
     clock: crate::Elapsing,
 ) -> Result<Session> {
     let current = store.get(&obtained.sub).await?;
-    let outcome = match orphaned_tokens(from, obtained, current.as_ref()) {
+    let outcome = match orphaned_tokens(obtained, current.as_ref()) {
         Some(orphan) => {
             revoke::revoke_orphaned_at(fetcher, nonces, &orphan_context(ctx), &orphan, clock).await
         }
@@ -342,40 +429,34 @@ fn no_session(sub: &str, gone: SessionGone) -> anyhow::Error {
     .into()
 }
 
-/// Which of the tokens a refresh `obtained` (from the session it refreshed
-/// `from`) may be revoked once the row is lost, given the row now on record
-/// (`current`). `None`: revoke nothing.
+/// Which of the tokens a refresh `obtained` may be revoked once the row is
+/// lost, given the row now on record (`current`). `None`: revoke nothing.
 ///
-/// **Never a token equal to `from`'s refresh token or to either of
-/// `current`'s.** A server that does not rotate answers with no
-/// `refresh_token`, and [`apply_refresh`] keeps `from`'s: revoking `obtained`
-/// whole sent THAT token, ending the grant another process's row
-/// (`{their-access, old-refresh}`) still lives on.
+/// **Never a token `current` holds**, and every other one. A server that does
+/// not rotate answers with no `refresh_token`, and [`apply_refresh`] keeps the
+/// one the refresh started from, so `obtained` is `{new-access, old-refresh}`:
 ///
-/// **And the new access token only when its grant is on record nowhere.**
-/// Without a new refresh token, the new access token belongs to `from`'s
-/// grant, and revoking an access token may end its whole grant (RFC 7009
-/// §2.1: the server MAY revoke the refresh token too). So when `current`
-/// still holds that refresh token, nothing is revoked; when the row is gone
-/// or holds another grant, the new access token alone is.
-fn orphaned_tokens(
-    from: &Session,
-    obtained: &Session,
-    current: Option<&Session>,
-) -> Option<Session> {
-    let kept = |t: &str| {
-        t.is_empty()
-            || t == from.refresh_token
-            || t == from.access_token
-            || current.is_some_and(|c| t == c.refresh_token || t == c.access_token)
+/// * when `current` still holds `old-refresh` (another process's refresh of
+///   the same grant wrote `{their-access, old-refresh}`), revoking it would end
+///   the grant the row on record lives on, and so would revoking the new
+///   access token (RFC 7009 §2.1: the server MAY revoke the refresh token
+///   along with it). Nothing is revoked;
+/// * when the row is gone, or holds another grant (a re-login, which does not
+///   revoke the grant it replaced), `old-refresh` is on record nowhere and is
+///   revoked: it is live, unreferenced, and ends the new access token too.
+///
+/// At a rotating server `obtained` is a new pair, revoked unless the row on
+/// record holds it.
+fn orphaned_tokens(obtained: &Session, current: Option<&Session>) -> Option<Session> {
+    let held = |t: &str| {
+        t.is_empty() || current.is_some_and(|c| t == c.refresh_token || t == c.access_token)
     };
-    let refresh = (!kept(&obtained.refresh_token)).then(|| obtained.refresh_token.clone());
-    let grant_on_record = refresh.is_none()
-        && current.is_some_and(|c| {
-            !obtained.refresh_token.is_empty() && c.refresh_token == obtained.refresh_token
-        });
+    let refresh = (!held(&obtained.refresh_token)).then(|| obtained.refresh_token.clone());
+    // The grant is on record when the row holds its refresh token: then its
+    // access token is not ours to revoke either.
+    let grant_on_record = !obtained.refresh_token.is_empty() && refresh.is_none();
     let access =
-        (!kept(&obtained.access_token) && !grant_on_record).then(|| obtained.access_token.clone());
+        (!held(&obtained.access_token) && !grant_on_record).then(|| obtained.access_token.clone());
     if refresh.is_none() && access.is_none() {
         return None;
     }
@@ -546,8 +627,35 @@ async fn refresh_locked<S: SessionStore>(
         // upsert landing after such a sign-out's delete RESURRECTED the
         // session with these fresh tokens, after it had been reported signed
         // out.
-        if !store.update_if_unchanged(&updated, version).await? {
-            return lost_the_row(store, fetcher, nonces, ctx, session, &updated, clock).await;
+        //
+        // **An error is not a lost row.** `Ok(false)` says another writer
+        // changed the row, and the new tokens are then orphans to revoke. An
+        // `Err` says the store cannot tell (a locked database, or a commit
+        // whose acknowledgement was lost): if the write committed, the new
+        // refresh token IS the row on record; if not, a rotating server has
+        // consumed the stored one and the new one is the grant's ONLY live
+        // refresh token. Revoking it logs the user out either way, over a
+        // database hiccup; keeping it costs one unreferenced token until it
+        // expires. So nothing is revoked and the error is returned. If the
+        // write did not commit, the next refresh presents the consumed token,
+        // gets `invalid_grant`, and the user logs in again: the same outcome
+        // as revoking, but only when the store really lost the write.
+        let written = match store.update_if_unchanged(&updated, version).await {
+            Ok(written) => written,
+            Err(err) => {
+                tracing::warn!(
+                    sub = %session.sub,
+                    error = %format!("{err:#}"),
+                    "a refreshed session could not be stored; its new tokens were left live"
+                );
+                return Err(err.context(
+                    "storing the refreshed session (its new tokens were neither stored nor \
+                     revoked)",
+                ));
+            }
+        };
+        if !written {
+            return lost_the_row(store, fetcher, nonces, ctx, &updated, clock).await;
         }
         // Logged because a refresh is otherwise INVISIBLE: it rotates both
         // tokens and is the one path that can silently end a session, but it
@@ -1299,12 +1407,14 @@ mod tests {
     }
 
     /// The same non-rotating refresh, when the row was SIGNED OUT or replaced
-    /// by another grant: the new access token is stored nowhere and its grant
-    /// is on record nowhere, so it alone is revoked. The refresh token it
-    /// started from is never sent (it is not this refresh's to end, and the
-    /// sign-out or re-login that replaced it answers for it).
+    /// by another grant: its grant (the refresh token it started from, which
+    /// the server did not rotate) is on record nowhere, so that refresh token
+    /// is revoked, ending the new access token with it (RFC 7009 §2.1). A
+    /// re-login does not revoke the grant it replaces, so leaving it would
+    /// keep an unreferenced refresh token live until it expires. One request,
+    /// and no token the row on record holds.
     #[tokio::test]
-    async fn a_non_rotating_refresh_that_lost_the_row_revokes_only_its_new_access_token() {
+    async fn a_non_rotating_refresh_that_lost_the_row_revokes_its_unreferenced_grant() {
         for relogin in [false, true] {
             let (fetcher, base, log) = token_server_answering(no_rotation()).await;
             let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
@@ -1337,10 +1447,56 @@ mod tests {
             assert_eq!(revokes.len(), 1, "relogin={relogin}: {revokes:#?}");
             assert_eq!(
                 form_param(&revokes[0], "token").as_deref(),
-                Some("rotated-access"),
-                "relogin={relogin}: {revokes:#?}"
+                Some("old-refresh"),
+                "relogin={relogin}: the old grant was left live: {revokes:#?}"
             );
         }
+    }
+
+    /// **Which tokens of a lost row are revoked: never one `current` holds.**
+    /// A non-rotating server answered `{A2}` for `{A1, R1}`, so the refresh
+    /// holds `{A2, R1}`. A re-login meanwhile wrote `{A3, R3}`: R1's grant is
+    /// on record nowhere, and a re-login does not revoke it, so R1 is revoked
+    /// (it ends A2 too). Signed out: the same. A row on record still holding
+    /// R1 (`{A3, R1}`, another process's refresh of the same grant): nothing.
+    #[test]
+    fn a_lost_row_revokes_every_token_the_row_on_record_does_not_hold() {
+        let with = |access: &str, refresh: &str| Session {
+            access_token: access.into(),
+            refresh_token: refresh.into(),
+            ..session()
+        };
+        // Refreshed from {A1, R1}.
+        let obtained = with("A2", "R1");
+        let tokens = |s: Option<Session>| s.map(|s| (s.access_token, s.refresh_token));
+
+        // A re-login at the same server: R1's grant is unreferenced.
+        let relogin = with("A3", "R3");
+        assert_eq!(
+            tokens(orphaned_tokens(&obtained, Some(&relogin))),
+            Some(("A2".into(), "R1".into())),
+            "the replaced grant's refresh token was left live"
+        );
+        // Signed out: the same.
+        assert_eq!(
+            tokens(orphaned_tokens(&obtained, None)),
+            Some(("A2".into(), "R1".into()))
+        );
+        // The row on record still lives on R1: nothing at all.
+        assert_eq!(
+            tokens(orphaned_tokens(&obtained, Some(&with("A3", "R1")))),
+            None,
+            "revoked a token of the grant on record"
+        );
+        // A rotating server: the rotated pair, never the row's.
+        assert_eq!(
+            tokens(orphaned_tokens(&with("A2", "R2"), Some(&relogin))),
+            Some(("A2".into(), "R2".into()))
+        );
+        assert_eq!(
+            tokens(orphaned_tokens(&with("A3", "R3"), Some(&relogin))),
+            None
+        );
     }
 
     /// Which tokens of an unapplied 2xx are revoked, rule by rule: never one
@@ -1491,6 +1647,87 @@ mod tests {
             Some(theirs),
             "the live session was deleted or changed"
         );
+    }
+
+    /// A [`MemorySessions`] whose `update_if_unchanged` fails, as a database
+    /// that is locked or briefly unreachable does: the store cannot say
+    /// whether the row changed. Nothing is written.
+    struct WriteFails(MemorySessions);
+
+    impl SessionStore for WriteFails {
+        type Version = MemoryVersion;
+
+        async fn get(&self, sub: &str) -> anyhow::Result<Option<Session>> {
+            self.0.get(sub).await
+        }
+        async fn get_versioned(
+            &self,
+            sub: &str,
+        ) -> anyhow::Result<Option<(Session, MemoryVersion)>> {
+            self.0.get_versioned(sub).await
+        }
+        async fn put(&self, session: &Session) -> anyhow::Result<()> {
+            self.0.put(session).await
+        }
+        async fn update_if_unchanged(
+            &self,
+            _session: &Session,
+            _version: &MemoryVersion,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("database is locked")
+        }
+        async fn delete(&self, sub: &str) -> anyhow::Result<bool> {
+            self.0.delete(sub).await
+        }
+        async fn delete_if_unchanged(
+            &self,
+            sub: &str,
+            version: &MemoryVersion,
+        ) -> anyhow::Result<bool> {
+            self.0.delete_if_unchanged(sub, version).await
+        }
+    }
+
+    /// **A refresh whose write ERRORS (not `Ok(false)`) revokes nothing.**
+    /// The server consumed the stored refresh token and issued a new one; the
+    /// store cannot say whether the row changed (a locked database, or a
+    /// commit whose acknowledgement was lost). Treating that as a lost row
+    /// would revoke the new refresh token: if the write did commit, that is
+    /// the row on record; if not, it is the grant's only live refresh token.
+    /// Either way the user would be logged out over a busy database. So the
+    /// error is returned, saying the new tokens were neither stored nor
+    /// revoked, and nothing is sent to `/revoke`.
+    #[tokio::test]
+    async fn a_refresh_whose_write_errors_returns_the_error_and_revokes_nothing() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (memory, session, version) = stored_stale().await;
+        let store = WriteFails(memory);
+
+        let result = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await;
+        assert_eq!(token_requests(&log).len(), 1, "precondition: refreshed");
+        let revokes = revoke_requests(&log);
+        assert!(
+            revokes.is_empty(),
+            "revoked the grant's only live refresh token over a store error: {revokes:#?}"
+        );
+        let err = result.expect_err("an unstored refresh is not a session");
+        let text = format!("{err:#}");
+        assert!(text.contains("database is locked"), "{text}");
+        assert!(
+            text.contains("neither stored nor revoked"),
+            "the error does not say what happened to the new tokens: {text}"
+        );
+        assert_eq!(store.0.get(DID).await.unwrap(), Some(session));
     }
 
     /// A [`MemorySessions`] that stores `relogin` right after the first `get`
@@ -2005,6 +2242,80 @@ mod tests {
         .await
         .expect_err("no session");
         assert!(format!("{err:#}").contains("no session for"), "{err:#}");
+    }
+
+    /// **A row that moved to another issuer under the lock is told apart
+    /// from a mix-up.** The first read was at the context's issuer; a
+    /// re-login at another authorization server landed before the lock, so
+    /// the re-read row is another server's grant. Nothing is sent, and the
+    /// error is `StoredIssuerChanged` (re-read the row and discover ITS
+    /// issuer), not `IssuerMismatch`, which says the PDS named another server.
+    /// A context at another issuer from the start is still `IssuerMismatch`.
+    #[tokio::test]
+    async fn a_row_re_logged_at_another_issuer_before_the_lock_is_stored_issuer_changed() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (memory, stale, _) = stored_stale().await;
+        let moved = Session {
+            issuer: "https://other-as.example.com".into(),
+            refresh_token: "moved-refresh".into(),
+            ..stale.clone()
+        };
+        let store = ReloginAfterRead {
+            inner: memory,
+            relogin: std::sync::Mutex::new(Some(moved.clone())),
+        };
+        let err = valid_session(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &RefreshLocks::default(),
+            DID,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect_err("another issuer's grant must not be refreshed here");
+        match crate::Error::find(&err) {
+            Some(crate::Error::Discovery(crate::error::DiscoveryError::StoredIssuerChanged {
+                stored,
+                expected,
+                ..
+            })) => {
+                assert_eq!(stored, "https://other-as.example.com");
+                assert_eq!(expected, ISSUER);
+            }
+            other => panic!("not told apart from a mix-up: {other:?} ({err:#})"),
+        }
+        assert!(log.lock().unwrap().is_empty(), "{:#?}", log.lock().unwrap());
+        assert_eq!(store.inner.get(DID).await.unwrap(), Some(moved));
+
+        // The context at another issuer from the start: a mix-up, as before.
+        let (store, _, _) = stored_stale().await;
+        let err = valid_session(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &RefreshLocks::default(),
+            DID,
+            &RefreshContext {
+                issuer: "https://other-as.example.com",
+                ..ctx(&token, &revoke)
+            },
+            NOW,
+        )
+        .await
+        .expect_err("a mix-up");
+        assert!(
+            matches!(
+                crate::Error::find(&err),
+                Some(crate::Error::Discovery(
+                    crate::error::DiscoveryError::IssuerMismatch { .. }
+                ))
+            ),
+            "{err:#}"
+        );
+        assert!(log.lock().unwrap().is_empty());
     }
 
     /// **A refresh that waited on the lock uses the winner's tokens.** Whoever

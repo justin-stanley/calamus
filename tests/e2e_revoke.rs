@@ -5,6 +5,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use calamus::discovery::AuthorizationServer;
 use calamus::revoke::{sign_out, Revocation, RevokeContext, REVOKE_DEADLINE};
 use calamus::store::SessionStore;
 use calamus::testing::fake::{AS_HOST, OTHER_AS_HOST};
@@ -12,18 +13,10 @@ use common::{session_jkt, World, NOW};
 
 fn context<'a>(
     w: &'a World,
-    issuer: &'a str,
-    endpoint: Option<&'a str>,
+    server: &'a AuthorizationServer,
     deadline: Duration,
 ) -> RevokeContext<'a> {
-    RevokeContext {
-        revocation_endpoint: endpoint,
-        client_id: w.client.client_id(),
-        auth_method: w.client.auth_method(),
-        client_key: w.client.key(),
-        deadline,
-        issuer,
-    }
+    RevokeContext::new(server, &w.client).with_deadline(deadline)
 }
 
 /// **Sign-out presents the refresh token, proved with the session's own DPoP
@@ -35,12 +28,7 @@ async fn sign_out_presents_the_refresh_token_with_the_sessions_dpop_key_and_dele
     let w = World::new().await;
     let login = w.login().await;
     let server = w.discover_for(&login.session).await.unwrap();
-    let ctx = context(
-        &w,
-        &server.issuer,
-        server.revocation_endpoint.as_deref(),
-        REVOKE_DEADLINE,
-    );
+    let ctx = context(&w, &server, REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
     assert_eq!(outcome, Revocation::Revoked);
@@ -73,7 +61,7 @@ async fn sign_out_with_no_revocation_endpoint_still_deletes() {
     let login = w.login().await;
     let server = w.discover_for(&login.session).await.unwrap();
     assert_eq!(server.revocation_endpoint, None);
-    let ctx = context(&w, &server.issuer, None, REVOKE_DEADLINE);
+    let ctx = context(&w, &server, REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
     assert!(matches!(outcome, Revocation::Failed(_)), "{outcome:?}");
@@ -91,12 +79,7 @@ async fn a_hanging_server_does_not_hold_the_sign_out_open() {
     let w = World::new().await;
     let login = w.login().await;
     let server = w.discover_for(&login.session).await.unwrap();
-    let ctx = context(
-        &w,
-        &server.issuer,
-        server.revocation_endpoint.as_deref(),
-        Duration::from_millis(300),
-    );
+    let ctx = context(&w, &server, Duration::from_millis(300));
     w.fake.stall_next(Duration::from_secs(30));
 
     let began = Instant::now();
@@ -135,12 +118,7 @@ async fn a_sign_out_whose_first_read_is_another_issuers_row_sends_nothing_and_le
     .expect("the moved server's own metadata is consistent");
     assert_ne!(moved.issuer, login.session.issuer, "precondition");
     assert!(moved.revocation_endpoint.is_some(), "precondition");
-    let ctx = context(
-        &w,
-        &moved.issuer,
-        moved.revocation_endpoint.as_deref(),
-        REVOKE_DEADLINE,
-    );
+    let ctx = context(&w, &moved, REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
     match &outcome {
@@ -159,5 +137,39 @@ async fn a_sign_out_whose_first_read_is_another_issuers_row_sends_nothing_and_le
         w.sessions.get(&login.did).await.unwrap(),
         Some(login.session.clone()),
         "the other issuer's live grant was deleted unrevoked"
+    );
+}
+
+/// **A revocation context carries the issuer of the discovery its endpoint
+/// came from**: built with `RevokeContext::new` from a discovery at the
+/// server the repointed PDS names, its issuer is that server's, so the stored
+/// grant (another issuer's) is neither sent nor deleted.
+#[tokio::test]
+async fn a_revoke_context_from_a_discovery_at_another_issuer_sends_nothing() {
+    let w = World::new().await;
+    let login = w.login().await;
+    w.fake.point_pds_at(OTHER_AS_HOST);
+    let moved = calamus::discovery::discover(
+        &w.fetcher,
+        &login.session.aud,
+        w.client.auth_method().as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    let ctx = RevokeContext::new(&moved, &w.client);
+    assert_eq!(ctx.issuer(), moved.issuer);
+    assert_eq!(
+        ctx.revocation_endpoint(),
+        moved.revocation_endpoint.as_deref()
+    );
+    assert_eq!(ctx.deadline(), REVOKE_DEADLINE);
+
+    let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
+    assert!(matches!(outcome, Revocation::LeftInPlace(_)), "{outcome:?}");
+    assert_eq!(w.fake.count_on_any_as("/revoke"), 0);
+    assert_eq!(
+        w.sessions.get(&login.did).await.unwrap(),
+        Some(login.session.clone())
     );
 }

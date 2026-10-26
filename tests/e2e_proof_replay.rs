@@ -55,14 +55,7 @@ async fn the_client_never_replays_a_dpop_proof() {
     #[cfg(feature = "revoke")]
     {
         w.fake.rotate_nonces();
-        let ctx = calamus::revoke::RevokeContext {
-            revocation_endpoint: server.revocation_endpoint.as_deref(),
-            client_id: w.client.client_id(),
-            auth_method: w.client.auth_method(),
-            client_key: w.client.key(),
-            deadline: calamus::revoke::REVOKE_DEADLINE,
-            issuer: &server.issuer,
-        };
+        let ctx = calamus::revoke::RevokeContext::new(&server, &w.client);
         let outcome = calamus::revoke::sign_out(
             &w.sessions,
             &w.fetcher,

@@ -245,6 +245,15 @@ pub trait SessionStore: Send + Sync {
     /// Replace the session for `session.sub` ONLY if its row is still at
     /// `version`, atomically. `true` if written; `false` if the row is gone or
     /// was rewritten since, and then nothing is written. Never an upsert.
+    ///
+    /// **`false` only when the row really changed.** The refresh path revokes
+    /// the tokens it could not store on `false`, and those include the
+    /// refresh token the server has just rotated to. A lock or busy timeout
+    /// (`SQLITE_BUSY`), or any failure that does not prove another writer
+    /// committed, must be retried inside the store or returned as `Err`
+    /// (the refresh then fails its request and revokes nothing); only a
+    /// failure that proves the row changed (Postgres `40001` from a
+    /// version-guarded `UPDATE`) may be reported as `false`.
     fn update_if_unchanged(
         &self,
         session: &Session,
@@ -255,7 +264,10 @@ pub trait SessionStore: Send + Sync {
     fn delete(&self, sub: &str) -> impl Future<Output = Result<bool>> + Send;
 
     /// Delete the session for `sub` ONLY if its row is still at `version`,
-    /// atomically. `true` if deleted; `false` if gone or rewritten since.
+    /// atomically. `true` if deleted; `false` if gone or rewritten since. As
+    /// for [`SessionStore::update_if_unchanged`], `false` only when the row
+    /// really changed; a lock or busy timeout is retried or returned as `Err`
+    /// (a sign-out then reports the user still signed in).
     fn delete_if_unchanged(
         &self,
         sub: &str,
@@ -649,6 +661,56 @@ mod tests {
             std::sync::Arc::new(MemoryPendingLogins::new()),
             2,
             1,
+        )
+        .await;
+    }
+
+    /// **A parallel step with too few writers or no rounds refuses to run**:
+    /// one task never races, and zero rounds test nothing, so either passes
+    /// for any store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "at least two")]
+    async fn the_parallel_writes_refuse_a_single_task() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            std::sync::Arc::new(MemorySessions::new()),
+            1,
+            1,
+        )
+        .await;
+    }
+
+    /// The same, for zero rounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "at least one round")]
+    async fn the_parallel_writes_refuse_zero_rounds() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            std::sync::Arc::new(MemorySessions::new()),
+            2,
+            0,
+        )
+        .await;
+    }
+
+    /// The parallel `take`, with one task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "at least two")]
+    async fn the_parallel_take_refuses_a_single_task() {
+        crate::testing::store_contract::pending_take_is_atomic(
+            std::sync::Arc::new(MemoryPendingLogins::new()),
+            1,
+            1,
+        )
+        .await;
+    }
+
+    /// The parallel `take`, with zero rounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "at least one round")]
+    async fn the_parallel_take_refuses_zero_rounds() {
+        crate::testing::store_contract::pending_take_is_atomic(
+            std::sync::Arc::new(MemoryPendingLogins::new()),
+            2,
+            0,
         )
         .await;
     }

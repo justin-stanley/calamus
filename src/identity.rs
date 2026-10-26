@@ -16,7 +16,7 @@
 
 use anyhow::{bail, Context as _, Result};
 
-use crate::error::{HandleProblem, ResolutionError};
+use crate::error::{HandleProblem, NoDidReason, ResolutionError};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -215,7 +215,10 @@ pub fn join_txt_chunks(chunks: &[&[u8]]) -> String {
 ///
 /// The value after `did=` is deliberately NOT trimmed, matching the spec and the
 /// reference: a padded record is invalid rather than silently repaired.
-pub fn did_from_txt_records(records: &[String]) -> Result<Option<String>> {
+///
+/// `handle` is the handle the records were looked up for; a `did=` value that
+/// is not a DID is [`ResolutionError::NoDid`] for it.
+pub fn did_from_txt_records(handle: &str, records: &[String]) -> Result<Option<String>> {
     let mut candidates: Vec<&str> = records
         .iter()
         .filter_map(|r| r.strip_prefix("did="))
@@ -234,7 +237,12 @@ pub fn did_from_txt_records(records: &[String]) -> Result<Option<String>> {
         1 => {
             let did = candidates[0];
             if !is_atproto_did(did) {
-                bail!("_atproto TXT record does not contain a usable DID: {did:?}");
+                return Err(no_did(
+                    handle,
+                    NoDidReason::TxtRecordNotADid {
+                        value: did.to_string(),
+                    },
+                ));
             }
             Ok(Some(did.to_string()))
         }
@@ -243,12 +251,22 @@ pub fn did_from_txt_records(records: &[String]) -> Result<Option<String>> {
 }
 
 /// Extract the DID from a `/.well-known/atproto-did` body: first line, trimmed.
-pub fn did_from_well_known(body: &str) -> Result<String> {
+/// A body that is not a DID is [`ResolutionError::NoDid`] for `handle`.
+pub fn did_from_well_known(handle: &str, body: &str) -> Result<String> {
     let did = body.lines().next().unwrap_or_default().trim();
     if !is_atproto_did(did) {
-        bail!("/.well-known/atproto-did did not contain a usable DID");
+        return Err(no_did(handle, NoDidReason::WellKnownNotADid));
     }
     Ok(did.to_string())
+}
+
+/// [`ResolutionError::NoDid`] for `handle`, as an `anyhow::Error`.
+pub(crate) fn no_did(handle: &str, reason: NoDidReason) -> anyhow::Error {
+    crate::Error::from(ResolutionError::NoDid {
+        handle: handle.to_string(),
+        reason,
+    })
+    .into()
 }
 
 /// Where a DID's document lives.
@@ -524,7 +542,9 @@ mod tests {
         let (head, tail) = long.split_at(20);
         let joined = join_txt_chunks(&[head.as_bytes(), tail.as_bytes()]);
         assert_eq!(
-            did_from_txt_records(&[joined]).unwrap().as_deref(),
+            did_from_txt_records("alice.test", &[joined])
+                .unwrap()
+                .as_deref(),
             Some(DID)
         );
     }
@@ -533,7 +553,9 @@ mod tests {
     fn a_single_did_record_resolves() {
         let records = vec![format!("did={DID}")];
         assert_eq!(
-            did_from_txt_records(&records).unwrap().as_deref(),
+            did_from_txt_records("alice.test", &records)
+                .unwrap()
+                .as_deref(),
             Some(DID)
         );
     }
@@ -546,7 +568,9 @@ mod tests {
             "google-site-verification=abc".to_string(),
         ];
         assert_eq!(
-            did_from_txt_records(&records).unwrap().as_deref(),
+            did_from_txt_records("alice.test", &records)
+                .unwrap()
+                .as_deref(),
             Some(DID)
         );
     }
@@ -560,13 +584,13 @@ mod tests {
             format!("did={DID}"),
             "did=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ];
-        assert!(did_from_txt_records(&records).is_err());
+        assert!(did_from_txt_records("alice.test", &records).is_err());
     }
 
     #[test]
     fn no_did_record_is_absent_not_an_error() {
         let records = vec!["v=spf1 -all".to_string()];
-        assert_eq!(did_from_txt_records(&records).unwrap(), None);
+        assert_eq!(did_from_txt_records("alice.test", &records).unwrap(), None);
     }
 
     /// The value after `did=` is NOT trimmed — deliberately, to stay consistent
@@ -574,14 +598,14 @@ mod tests {
     #[test]
     fn a_padded_did_value_is_invalid() {
         let records = vec![format!("did= {DID}")];
-        assert!(did_from_txt_records(&records).is_err());
+        assert!(did_from_txt_records("alice.test", &records).is_err());
     }
 
     #[test]
     fn a_non_did_value_is_rejected() {
         for value in ["did=notadid", "did=", "did=did:unknown:xyz"] {
             assert!(
-                did_from_txt_records(&[value.to_string()]).is_err(),
+                did_from_txt_records("alice.test", &[value.to_string()]).is_err(),
                 "accepted {value}"
             );
         }
@@ -591,10 +615,16 @@ mod tests {
 
     #[test]
     fn the_well_known_body_takes_the_first_line_trimmed() {
-        assert_eq!(did_from_well_known(&format!("{DID}\n")).unwrap(), DID);
-        assert_eq!(did_from_well_known(&format!("  {DID}  ")).unwrap(), DID);
         assert_eq!(
-            did_from_well_known(&format!("{DID}\nignored")).unwrap(),
+            did_from_well_known("alice.test", &format!("{DID}\n")).unwrap(),
+            DID
+        );
+        assert_eq!(
+            did_from_well_known("alice.test", &format!("  {DID}  ")).unwrap(),
+            DID
+        );
+        assert_eq!(
+            did_from_well_known("alice.test", &format!("{DID}\nignored")).unwrap(),
             DID
         );
     }
@@ -602,7 +632,10 @@ mod tests {
     #[test]
     fn a_well_known_body_that_is_not_a_did_is_rejected() {
         for body in ["", "\n", "not a did", "<html>", "did:unknown:x"] {
-            assert!(did_from_well_known(body).is_err(), "accepted {body:?}");
+            assert!(
+                did_from_well_known("alice.test", body).is_err(),
+                "accepted {body:?}"
+            );
         }
     }
 

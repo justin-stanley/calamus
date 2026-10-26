@@ -195,7 +195,7 @@ pub async fn did_from_dns(dns: &impl DnsResolver, handle: &str) -> Result<Option
         })
         .collect();
 
-    identity::did_from_txt_records(&records)
+    identity::did_from_txt_records(handle, &records)
         .with_context(|| format!("reading the {name} TXT record"))
 }
 
@@ -210,11 +210,20 @@ async fn did_from_well_known(fetcher: &Fetcher, handle: &str) -> Result<String> 
         .await
         .with_context(|| format!("fetching {url}"))?;
     let status = response.status().as_u16();
+    // A 4xx: nothing is served for that handle (a typo, or no such account),
+    // typed so a login form can say so. Anything else (a 5xx, a 3xx it would
+    // not follow) is not evidence of absence, and stays untyped.
+    if (400..500).contains(&status) {
+        return Err(identity::no_did(
+            handle,
+            crate::error::NoDidReason::WellKnownStatus { url, status },
+        ));
+    }
     if status != 200 {
         anyhow::bail!("{url} returned status {status}");
     }
     let body = fetcher.read_capped(response).await?;
-    identity::did_from_well_known(&String::from_utf8_lossy(&body))
+    identity::did_from_well_known(handle, &String::from_utf8_lossy(&body))
         .with_context(|| format!("reading {url}"))
 }
 
@@ -430,6 +439,42 @@ mod tests {
             rendered.contains("forbidden (internal) address"),
             "failed for the wrong reason: {rendered}"
         );
+    }
+
+    /// **A well-known 4xx is `NoDid`; a 5xx is not.** A 404 says nothing is
+    /// served for that handle (a typo); a 503 is an outage, and calling it
+    /// "no such handle" would tell a user to retype a correct handle. The
+    /// text is the same either way.
+    #[tokio::test]
+    async fn a_well_known_4xx_is_no_did_and_a_5xx_is_not() {
+        for (status, typed) in [(404, true), (410, true), (503, false), (500, false)] {
+            let (addr, _log) = crate::testing::spawn_tls(move |_| {
+                let mut r = std::collections::HashMap::new();
+                r.insert(
+                    "/.well-known/atproto-did".to_string(),
+                    vec![crate::testing::TestResponse::json(status, "{}")],
+                );
+                r
+            })
+            .await;
+            let fetcher = Fetcher::default();
+            crate::testing::test_host_override(&fetcher, "pds-e2e.test", addr);
+            let err = did_from_well_known(&fetcher, "pds-e2e.test")
+                .await
+                .expect_err("not a DID");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&format!("returned status {status}")),
+                "{text}"
+            );
+            let found = matches!(
+                crate::Error::find(&err),
+                Some(crate::Error::Resolution(
+                    crate::error::ResolutionError::NoDid { .. }
+                ))
+            );
+            assert_eq!(found, typed, "status {status}: {text}");
+        }
     }
 
     /// Reserved TLDs are rejected before any lookup happens, so a `.internal`

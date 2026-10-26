@@ -23,9 +23,11 @@
 use anyhow::Result;
 
 use crate::client_auth::{self, AuthMethod};
+use crate::discovery::AuthorizationServer;
 use crate::dpop::Endpoint;
 use crate::error::RevokeError;
 use crate::keys::SigningKey;
+use crate::login::Client;
 use crate::net::Fetcher;
 use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
 #[cfg(feature = "revoke")]
@@ -43,22 +45,26 @@ pub enum Revocation {
     NoSession,
     /// The attempt failed, and the local row was deleted anyway: the user is
     /// signed out locally, and the server may still hold the grant until it
-    /// expires. (From `sign_out`, the one exception is a store whose delete
-    /// itself failed; the reason then begins "deleting the local session".)
-    /// From [`revoke_orphaned`], there was no row to begin with.
+    /// expires. A store whose delete itself failed is never `Failed` (the row
+    /// may still be there): that is [`Revocation::LeftInPlace`]. From
+    /// [`revoke_orphaned`], there was no row to begin with.
     Failed(String),
-    /// **The sign-out did NOT delete the local row**, on purpose, and the
-    /// grant it holds was not revoked. Only `sign_out` and `sign_out_with`
-    /// report it, for two cases:
+    /// **The sign-out did NOT delete the local row** (or could not tell that
+    /// it did). Only `sign_out` and `sign_out_with` report it, for these cases:
     ///
     /// * the row on record belongs to **another authorization server** than
     ///   the one the context was discovered for (a re-login after a PDS
-    ///   migration, read first or re-read after a change);
+    ///   migration, read first or re-read after a change); not revoked;
     /// * the row **kept rotating** under concurrent refreshes, and its newest
-    ///   tokens were never presented.
+    ///   tokens were never presented;
+    /// * **the store's delete failed** (reason "deleting the local session:
+    ///   ...", then what the revocation did), or the row could not be read
+    ///   and the delete after it failed too (reason "reading the session: ...;
+    ///   deleting it also failed: ...", nothing revoked).
     ///
-    /// Deleting either would drop a live grant with no record left to revoke
-    /// it from. **The user is still signed in.** The caller must read the
+    /// Deleting in the first two cases would drop a live grant with no record
+    /// left to revoke it from; in the last the store did not let us. **The
+    /// user is still signed in.** The caller must read the
     /// row again, discover ITS issuer, and sign out again with that context
     /// (or revoke at that issuer); reporting the user signed out without doing
     /// so leaves them signed in.
@@ -118,36 +124,109 @@ pub const REVOKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// The deadline a background revocation (not a user's sign-out) waits for.
 pub const ORPHAN_REVOKE_DEADLINE: std::time::Duration = REVOKE_DEADLINE;
 
-/// What a revocation needs beyond the session itself. Mirrors
+/// What a revocation needs beyond the session itself: one authorization
+/// server's revocation endpoint, the issuer it was discovered for, this
+/// client's credentials, and a deadline. Mirrors
 /// [`crate::session::RefreshContext`]; `aud` is the issuer for both.
+///
+/// **Built only from an [`AuthorizationServer`]** ([`RevokeContext::new`],
+/// [`RevokeContext::with_auth`]), so the endpoint and the issuer it is checked
+/// against come from the SAME discovery. A session whose issuer is any other
+/// is refused before anything is sent ([`crate::discovery::same_issuer`]):
+/// another server answers 200 for a token it does not know, so the grant
+/// stays live while this reports it revoked, and its refresh token has been
+/// handed to that server. With public fields, a caller could pair a
+/// discovery's endpoint with the row's own issuer, which passes that check
+/// every time.
+///
+/// The check is not a value compared with itself: `sign_out` reads the row
+/// again (and again, if a refresh rotates it), and the row it ends up
+/// revoking can be a different grant at another authorization server (a
+/// re-login after a PDS migration). Such a row is left for a sign-out that
+/// discovers its own issuer, and `sign_out` reports
+/// [`Revocation::LeftInPlace`].
+///
+/// The fields cannot be set by hand outside calamus:
+///
+/// ```compile_fail
+/// let ctx = calamus::revoke::RevokeContext {
+///     revocation_endpoint: Some("https://as.example/revoke"),
+///     client_id: "https://app.example/client-metadata.json",
+///     auth_method: calamus::client_auth::AuthMethod::None,
+///     client_key: None,
+///     deadline: calamus::revoke::REVOKE_DEADLINE,
+///     issuer: "https://as.example",
+/// };
+/// ```
+#[derive(Clone, Copy)]
 pub struct RevokeContext<'a> {
     /// From the authorization server's metadata. Absent when the server
     /// advertises none, which is itself a reason revocation cannot happen.
-    pub revocation_endpoint: Option<&'a str>,
+    pub(crate) revocation_endpoint: Option<&'a str>,
     /// This client's `client_id`.
-    pub client_id: &'a str,
+    pub(crate) client_id: &'a str,
     /// How this client authenticates.
-    pub auth_method: AuthMethod,
+    pub(crate) auth_method: AuthMethod,
     /// The confidential client's signing key; unused by the dev client.
-    pub client_key: Option<&'a SigningKey>,
-    /// Longest to wait on the authorization server before giving up. Injectable
-    /// so the deadline can be TESTED without a five-second test.
-    pub deadline: std::time::Duration,
-    /// The authorization server `revocation_endpoint` was discovered for. A
-    /// session whose issuer is any other is refused before anything is sent
-    /// ([`crate::discovery::same_issuer`]): another server answers 200 for a
-    /// token it does not know, so the grant stays live while this reports it
-    /// revoked, and its refresh token has been handed to that server.
-    ///
-    /// **Set it to the issuer you ran discovery FOR**, usually the `issuer` of
-    /// your own earlier read of the session. It is not compared with itself:
-    /// `sign_out` reads the row again (and again, if a refresh rotates it),
-    /// and the row it ends up revoking can be a different grant at another
-    /// authorization server (a re-login after a PDS migration). The check ties
-    /// the endpoint to the grant actually being sent there; such a row is left
-    /// for a sign-out that discovers its own issuer, and `sign_out` reports
-    /// [`Revocation::LeftInPlace`].
-    pub issuer: &'a str,
+    pub(crate) client_key: Option<&'a SigningKey>,
+    /// Longest to wait on the authorization server before giving up.
+    pub(crate) deadline: std::time::Duration,
+    /// The authorization server `revocation_endpoint` was discovered for.
+    pub(crate) issuer: &'a str,
+}
+
+impl<'a> RevokeContext<'a> {
+    /// A context for revoking at `server`, as `client`, within
+    /// [`REVOKE_DEADLINE`].
+    pub fn new(server: &'a AuthorizationServer, client: &'a Client) -> Self {
+        Self::with_auth(
+            server,
+            client.client_id(),
+            client.auth_method(),
+            client.key(),
+        )
+    }
+
+    /// A context for revoking at `server`, with the client's credentials
+    /// given piecewise (for a caller without a [`Client`]), within
+    /// [`REVOKE_DEADLINE`].
+    pub fn with_auth(
+        server: &'a AuthorizationServer,
+        client_id: &'a str,
+        auth_method: AuthMethod,
+        client_key: Option<&'a SigningKey>,
+    ) -> Self {
+        Self {
+            revocation_endpoint: server.revocation_endpoint.as_deref(),
+            client_id,
+            auth_method,
+            client_key,
+            deadline: REVOKE_DEADLINE,
+            issuer: &server.issuer,
+        }
+    }
+
+    /// The same context, waiting at most `deadline` on the authorization
+    /// server. Injectable so the deadline can be TESTED without a five-second
+    /// test.
+    pub fn with_deadline(self, deadline: std::time::Duration) -> Self {
+        Self { deadline, ..self }
+    }
+
+    /// The issuer the endpoint was discovered for.
+    pub fn issuer(&self) -> &'a str {
+        self.issuer
+    }
+
+    /// The revocation endpoint, if the server advertises one.
+    pub fn revocation_endpoint(&self) -> Option<&'a str> {
+        self.revocation_endpoint
+    }
+
+    /// The deadline.
+    pub fn deadline(&self) -> std::time::Duration {
+        self.deadline
+    }
 }
 
 /// Revoke a token set that has NO local row to delete — bounded by
@@ -368,7 +447,8 @@ pub async fn sign_out(
 /// it) is read again and its new tokens revoked, up to three attempts; one that
 /// keeps changing is left in place, newest tokens on record, and reported as
 /// [`Revocation::LeftInPlace`]. A row that cannot be read is deleted anyway
-/// ([`Revocation::Failed`]).
+/// ([`Revocation::Failed`]). Whenever the row may still exist because the
+/// store's delete failed, the outcome is [`Revocation::LeftInPlace`].
 #[cfg(feature = "revoke")]
 pub async fn sign_out_with<S, F, Fut>(
     store: &S,
@@ -415,8 +495,17 @@ where
                 // Still delete: an unreadable row is exactly the state a
                 // sign-out should clear, and leaving it wedges every later
                 // request. No refresh can rotate a row nothing can read.
-                let _ = store.delete(sub).await;
-                return Revocation::Failed(format!("reading the session: {err:#}"));
+                return match store.delete(sub).await {
+                    Ok(_) => Revocation::Failed(format!("reading the session: {err:#}")),
+                    // A store that can neither read nor delete (a transient
+                    // outage): nothing was revoked and the row is intact, so
+                    // the user is still signed in.
+                    Err(delete_err) => Revocation::LeftInPlace(format!(
+                        "reading the session: {err:#}; deleting it also failed: \
+                         {delete_err:#}; nothing was revoked and the session may still be on \
+                         record"
+                    )),
+                };
             }
         };
         if let Some(refused) = refuse(&session) {
@@ -494,9 +583,24 @@ where
     match store.delete_if_unchanged(sub, version).await {
         Ok(true) => Attempt::Done(outcome),
         Ok(false) => Attempt::Changed(outcome),
-        Err(err) => Attempt::Done(Revocation::Failed(format!(
-            "deleting the local session: {err:#}"
+        // The row may still be on record: the user is still signed in,
+        // whatever the server said.
+        Err(err) => Attempt::Done(Revocation::LeftInPlace(format!(
+            "deleting the local session: {err:#}; the session may still be on record ({})",
+            describe(&outcome)
         ))),
+    }
+}
+
+/// The revocation's outcome, as a clause of a [`Revocation::LeftInPlace`]
+/// reason.
+#[cfg(feature = "revoke")]
+fn describe(outcome: &Revocation) -> String {
+    match outcome {
+        Revocation::Revoked => "the tokens were revoked".to_string(),
+        Revocation::NoSession => "there was nothing to revoke".to_string(),
+        Revocation::Failed(reason) => format!("revocation failed: {reason}"),
+        Revocation::LeftInPlace(reason) => reason.clone(),
     }
 }
 
@@ -1105,6 +1209,147 @@ mod tests {
                 store.0.get(DID).await.unwrap().is_none(),
                 "an unreadable row survived a sign-out, so the account stays wedged"
             );
+        }
+
+        /// A [`MemorySessions`] whose reads and/or deletes fail, as a database
+        /// that is briefly unreachable does. The row is untouched by a failed
+        /// call.
+        #[derive(Default)]
+        struct Faulty {
+            inner: MemorySessions,
+            fail_read: bool,
+            fail_delete: bool,
+        }
+
+        impl SessionStore for Faulty {
+            type Version = <MemorySessions as SessionStore>::Version;
+
+            async fn get(&self, sub: &str) -> anyhow::Result<Option<Session>> {
+                if self.fail_read {
+                    anyhow::bail!("database unavailable (read)");
+                }
+                self.inner.get(sub).await
+            }
+            async fn get_versioned(
+                &self,
+                sub: &str,
+            ) -> anyhow::Result<Option<(Session, Self::Version)>> {
+                if self.fail_read {
+                    anyhow::bail!("database unavailable (read)");
+                }
+                self.inner.get_versioned(sub).await
+            }
+            async fn put(&self, session: &Session) -> anyhow::Result<()> {
+                self.inner.put(session).await
+            }
+            async fn update_if_unchanged(
+                &self,
+                session: &Session,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                self.inner.update_if_unchanged(session, version).await
+            }
+            async fn delete(&self, sub: &str) -> anyhow::Result<bool> {
+                if self.fail_delete {
+                    anyhow::bail!("database unavailable (delete)");
+                }
+                self.inner.delete(sub).await
+            }
+            async fn delete_if_unchanged(
+                &self,
+                sub: &str,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                if self.fail_delete {
+                    anyhow::bail!("database unavailable (delete)");
+                }
+                self.inner.delete_if_unchanged(sub, version).await
+            }
+        }
+
+        /// **A sign-out whose delete fails reports the user still signed in.**
+        /// The tokens were revoked, but the row is still on record, so
+        /// `Failed` (which says the row is gone) would be a lie: the caller
+        /// would show "signed out" over a session row that still exists.
+        #[tokio::test]
+        async fn a_sign_out_whose_delete_fails_is_left_in_place() {
+            let store = Faulty {
+                fail_delete: true,
+                ..Default::default()
+            };
+            stored(&store.inner).await;
+
+            let outcome = sign_out_with(&store, DID, TEST_DEADLINE, |_| async {
+                Revocation::Revoked
+            })
+            .await;
+            match &outcome {
+                Revocation::LeftInPlace(reason) => {
+                    assert!(reason.contains("deleting the local session"), "{reason}");
+                    assert!(reason.contains("database unavailable (delete)"), "{reason}");
+                    assert!(reason.contains("the tokens were revoked"), "{reason}");
+                }
+                other => panic!("the row is still there, so the user is signed in: {other:?}"),
+            }
+            assert!(store.inner.get(DID).await.unwrap().is_some());
+
+            // A failed revocation and a failed delete: still in place, and the
+            // reason carries the revocation's failure too.
+            let outcome = sign_out_with(&store, DID, TEST_DEADLINE, |_| async {
+                Revocation::Failed("the revocation endpoint returned status 500".into())
+            })
+            .await;
+            match &outcome {
+                Revocation::LeftInPlace(reason) => {
+                    assert!(reason.contains("deleting the local session"), "{reason}");
+                    assert!(reason.contains("status 500"), "{reason}");
+                }
+                other => panic!("the row is still there, so the user is signed in: {other:?}"),
+            }
+        }
+
+        /// **An unreadable row whose delete ALSO fails is left in place, not
+        /// `Failed`.** A transient outage fails both: nothing was revoked and
+        /// the row is intact, so the user is still signed in.
+        #[tokio::test]
+        async fn an_unreadable_session_whose_delete_fails_is_left_in_place() {
+            let store = Faulty {
+                fail_read: true,
+                fail_delete: true,
+                ..Default::default()
+            };
+            stored(&store.inner).await;
+
+            let revoked = std::sync::atomic::AtomicBool::new(false);
+            let outcome = sign_out_with(&store, DID, TEST_DEADLINE, |_| {
+                revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Revocation::Revoked }
+            })
+            .await;
+            assert!(!revoked.load(std::sync::atomic::Ordering::SeqCst));
+            match &outcome {
+                Revocation::LeftInPlace(reason) => {
+                    assert!(reason.contains("reading the session"), "{reason}");
+                    assert!(reason.contains("database unavailable (read)"), "{reason}");
+                    assert!(reason.contains("database unavailable (delete)"), "{reason}");
+                    assert!(reason.contains("nothing was revoked"), "{reason}");
+                }
+                other => panic!("the row is still there, so the user is signed in: {other:?}"),
+            }
+            assert!(store.inner.get(DID).await.unwrap().is_some());
+
+            // The read failing alone still deletes, and is `Failed`.
+            let store = Faulty {
+                fail_read: true,
+                ..Default::default()
+            };
+            stored(&store.inner).await;
+            let outcome = sign_out_with(&store, DID, TEST_DEADLINE, |_| async {
+                Revocation::Revoked
+            })
+            .await;
+            assert!(matches!(outcome, Revocation::Failed(_)), "{outcome:?}");
+            assert!(store.inner.get(DID).await.unwrap().is_none());
         }
 
         /// Logging out twice is not an error. The second call has nothing to revoke

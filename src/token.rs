@@ -175,7 +175,7 @@ pub fn is_stale_with_margin(expires_at: Option<i64>, now: i64, margin: i64) -> b
     let Some(expires_at) = expires_at else {
         return false;
     };
-    expires_at <= now + margin
+    expires_at <= now.saturating_add(margin)
 }
 
 /// A jittered refresh margin.
@@ -193,6 +193,7 @@ pub fn is_stale(expires_at: Option<i64>, now: i64) -> bool {
 
 /// What a failed refresh means for the stored session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RefreshFailure {
     /// The grant is dead. Delete the session and require a fresh login.
     SessionInvalid,

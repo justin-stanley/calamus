@@ -26,7 +26,8 @@ use crate::request::{self, DpopBody, DpopRequest, PostOutcome, Retry};
 use crate::store::{NonceStore, Session};
 
 /// Refuse anything that is not an atproto NSID: a reversed domain authority
-/// and a name, `.`-separated, at least three segments, at most 317 characters.
+/// and a name, `.`-separated, at least three segments, at most 317 characters,
+/// the authority (everything before the name) at most 253.
 /// Authority segments are 1–63 ASCII letters, digits and hyphens, not starting
 /// or ending with a hyphen (the first not starting with a digit); the name is
 /// 1–63 ASCII letters and digits, not starting with a digit. So no `/`, `?`,
@@ -41,6 +42,10 @@ pub fn validate_nsid(nsid: &str) -> Result<()> {
         return Err(refuse("fewer than three segments"));
     }
     let (name, authority) = segments.split_last().expect("at least three");
+    // The authority is a domain name (reversed), so at most 253 characters.
+    if nsid.len() - name.len() - 1 > 253 {
+        return Err(refuse("the authority is longer than 253 characters"));
+    }
     for (i, segment) in authority.iter().enumerate() {
         if segment.is_empty() || segment.len() > 63 {
             return Err(refuse(
@@ -52,7 +57,7 @@ pub fn validate_nsid(nsid: &str) -> Result<()> {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(refuse(
-                "an authority segment has a character other than a-z, 0-9, -",
+                "an authority segment has a character other than A-Z, a-z, 0-9, -",
             ));
         }
         if segment.starts_with('-') || segment.ends_with('-') {
@@ -376,6 +381,27 @@ mod tests {
             repo.url("com.atproto.repo.listRecords").unwrap(),
             "https://pds.example.com/xrpc/com.atproto.repo.listRecords",
             "a trailing slash on the audience must not double the separator"
+        );
+    }
+
+    /// **The authority is a domain name, so at most 253 characters**, even
+    /// when the whole NSID is under 317; and uppercase is allowed in it, as
+    /// the refusal now says.
+    #[test]
+    fn an_nsid_authority_is_at_most_253_characters() {
+        let seg = "a".repeat(63);
+        // 4 * 63 + 3 dots = 255 > 253; with the name, 257 <= 317.
+        let long = format!("{seg}.{seg}.{seg}.{seg}.x");
+        let err = validate_nsid(&long).expect_err("a 255-character authority was accepted");
+        assert!(format!("{err:#}").contains("253"), "{err:#}");
+        // 63 + 63 + 63 + 61 + 3 dots = 253: accepted.
+        let at_limit = format!("{seg}.{seg}.{seg}.{}.x", "a".repeat(61));
+        validate_nsid(&at_limit).expect("a 253-character authority");
+        validate_nsid("COM.Example.fooBar").expect("uppercase is allowed");
+        let err = validate_nsid("com.exa_mple.foo").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("A-Z, a-z, 0-9, -"),
+            "the message omits the uppercase it accepts: {err:#}"
         );
     }
 

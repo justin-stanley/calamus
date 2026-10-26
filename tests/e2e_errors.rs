@@ -18,6 +18,7 @@ mod common;
 
 use std::time::Duration;
 
+use calamus::discovery::AuthorizationServer;
 use calamus::flow::CallbackParams;
 use calamus::keys::SigningKey;
 use calamus::net::{FetchPolicy, Fetcher};
@@ -25,6 +26,7 @@ use calamus::revoke::{sign_out, Revocation, RevokeContext};
 use calamus::session::{valid_session, RefreshLocks};
 use calamus::store::SessionStore;
 use calamus::testing::fake::{HANDLE, OTHER_AS_HOST};
+use calamus::testing::StaticDns;
 use calamus::xrpc::Repo;
 use common::{World, NOW};
 
@@ -89,6 +91,14 @@ enum Trigger {
     RedirectedDidDocument,
     /// `try_revoke` at an authorization server with no revocation endpoint.
     TryRevokeNoEndpoint,
+    /// A login for a handle with no `_atproto` TXT record whose
+    /// `/.well-known/atproto-did` is a 404 (a typo, or no such account).
+    HandleWellKnown404,
+    /// A login for a handle whose `_atproto` TXT record is not a DID.
+    HandleTxtNotADid,
+    /// A login for a handle with no TXT record whose well-known file is not a
+    /// DID.
+    HandleWellKnownNotADid,
 }
 
 /// What a trigger produced: an error, or a revocation's reason (sign-out is
@@ -135,17 +145,22 @@ fn expect_err<T: std::fmt::Debug>(result: anyhow::Result<T>, what: &str) -> Outc
 
 fn revoke_context<'a>(
     w: &'a World,
-    issuer: &'a str,
-    endpoint: Option<&'a str>,
+    server: &'a AuthorizationServer,
     deadline: Duration,
 ) -> RevokeContext<'a> {
-    RevokeContext {
-        revocation_endpoint: endpoint,
-        client_id: w.client.client_id(),
-        auth_method: w.client.auth_method(),
-        client_key: w.client.key(),
-        deadline,
-        issuer,
+    RevokeContext::new(server, &w.client).with_deadline(deadline)
+}
+
+/// The session's own authorization server, with its revocation endpoint
+/// replaced by `endpoint`.
+async fn server_revoking_at(
+    w: &World,
+    session: &calamus::store::Session,
+    endpoint: Option<&str>,
+) -> AuthorizationServer {
+    AuthorizationServer {
+        revocation_endpoint: endpoint.map(str::to_string),
+        ..w.discover_for(session).await.unwrap()
     }
 }
 
@@ -182,12 +197,9 @@ async fn run(trigger: Trigger) -> Outcome {
         Trigger::RevokeAtInternalAddress => {
             let w = World::new().await;
             let login = w.login().await;
-            let ctx = revoke_context(
-                &w,
-                &login.session.issuer,
-                Some("https://127.0.0.1/revoke"),
-                Duration::from_secs(5),
-            );
+            let server =
+                server_revoking_at(&w, &login.session, Some("https://127.0.0.1/revoke")).await;
+            let ctx = revoke_context(&w, &server, Duration::from_secs(5));
             Outcome::Revocation(
                 sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await,
             )
@@ -316,17 +328,30 @@ async fn run(trigger: Trigger) -> Outcome {
             let w = World::new().await;
             expect_err(w.start("alice.local").await, "reserved TLD")
         }
+        Trigger::HandleWellKnown404 => {
+            let mut w = World::new().await;
+            w.dns = StaticDns::new();
+            w.fake.set_well_known_did(None);
+            expect_err(w.start(HANDLE).await, "no such handle")
+        }
+        Trigger::HandleTxtNotADid => {
+            let mut w = World::new().await;
+            w.dns =
+                StaticDns::new().with_txt(&format!("_atproto.{HANDLE}."), &[&["did=not-a-did"]]);
+            expect_err(w.start(HANDLE).await, "TXT record not a DID")
+        }
+        Trigger::HandleWellKnownNotADid => {
+            let mut w = World::new().await;
+            w.dns = StaticDns::new();
+            w.fake.set_well_known_did(Some("not-a-did"));
+            expect_err(w.start(HANDLE).await, "well-known file not a DID")
+        }
         Trigger::NoRevocationEndpoint => {
             let w = World::new().await;
             let login = w.login().await;
             w.fake.advertise_revocation(false);
             let server = w.discover_for(&login.session).await.unwrap();
-            let ctx = revoke_context(
-                &w,
-                &server.issuer,
-                server.revocation_endpoint.as_deref(),
-                Duration::from_secs(5),
-            );
+            let ctx = revoke_context(&w, &server, Duration::from_secs(5));
             Outcome::Revocation(
                 sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await,
             )
@@ -335,12 +360,7 @@ async fn run(trigger: Trigger) -> Outcome {
             let w = World::new().await;
             let login = w.login().await;
             let server = w.discover_for(&login.session).await.unwrap();
-            let ctx = revoke_context(
-                &w,
-                &server.issuer,
-                server.revocation_endpoint.as_deref(),
-                Duration::from_millis(300),
-            );
+            let ctx = revoke_context(&w, &server, Duration::from_millis(300));
             w.fake.stall_next(Duration::from_secs(30));
             Outcome::Revocation(
                 sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await,
@@ -468,7 +488,8 @@ async fn run(trigger: Trigger) -> Outcome {
         Trigger::TryRevokeNoEndpoint => {
             let w = World::new().await;
             let login = w.login().await;
-            let ctx = revoke_context(&w, &login.session.issuer, None, Duration::from_secs(5));
+            let server = server_revoking_at(&w, &login.session, None).await;
+            let ctx = revoke_context(&w, &server, Duration::from_secs(5));
             expect_err(
                 calamus::revoke::try_revoke(&w.fetcher, &w.nonces, &ctx, &login.session, NOW).await,
                 "no endpoint",
@@ -536,6 +557,20 @@ mod error_messages_callers_match_on_are_stable {
         (Trigger::EndpointOffOrigin, Contains("issuer's own origin")),
         // resolve.rs.
         (Trigger::ReservedTld, Contains("reserved TLD")),
+        // A handle that names no DID (now typed as ResolutionError::NoDid;
+        // pinned so the typing changed no text).
+        (
+            Trigger::HandleWellKnown404,
+            Contains("/.well-known/atproto-did returned status 404"),
+        ),
+        (
+            Trigger::HandleTxtNotADid,
+            Contains("_atproto TXT record does not contain a usable DID: \"not-a-did\""),
+        ),
+        (
+            Trigger::HandleWellKnownNotADid,
+            Contains("/.well-known/atproto-did did not contain a usable DID"),
+        ),
         // revoke.rs.
         (
             Trigger::NoRevocationEndpoint,
@@ -606,8 +641,8 @@ mod error_messages_callers_match_on_are_stable {
 mod typed {
     use super::*;
     use calamus::error::{
-        CallbackError, DiscoveryError, Grant, HandleProblem, RedirectRefusal, ResolutionError,
-        RevokeError, SessionGone, TokenError,
+        CallbackError, DiscoveryError, Grant, HandleProblem, NoDidReason, RedirectRefusal,
+        ResolutionError, RevokeError, SessionGone, TokenError,
     };
     use calamus::token::RefreshFailure;
     use calamus::Error;
@@ -627,7 +662,7 @@ mod typed {
     async fn an_ssrf_refusal_is_an_ssrf_error() {
         let (err, _) = typed(Trigger::FetchInternalLiteral).await;
         match find(&err) {
-            Error::Ssrf { host, ip } => {
+            Error::Ssrf { host, ip, .. } => {
                 assert_eq!(host, "127.0.0.1");
                 assert_eq!(ip.to_string(), "127.0.0.1");
             }
@@ -635,7 +670,7 @@ mod typed {
         }
         let (err, _) = typed(Trigger::FetchInternalName).await;
         match find(&err) {
-            Error::Ssrf { host, ip } => {
+            Error::Ssrf { host, ip, .. } => {
                 assert_eq!(host, "localhost");
                 assert!(ip.is_loopback(), "{ip}");
             }
@@ -651,6 +686,7 @@ mod typed {
                 status,
                 url,
                 refusal,
+                ..
             } => {
                 assert_eq!(*status, 302);
                 assert!(
@@ -674,6 +710,49 @@ mod typed {
             Error::Resolution(ResolutionError::InvalidHandle { handle, problem }) => {
                 assert_eq!(handle, "alice.local");
                 assert_eq!(*problem, HandleProblem::ReservedTld("local".into()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A handle that names no DID is `NoDid`**, so a login form can tell
+    /// a typo from an outage. Each path: the well-known 404, a TXT record that
+    /// is not a DID, a well-known file that is not one.
+    #[tokio::test]
+    async fn a_handle_naming_no_did_is_no_did() {
+        let (err, _) = typed(Trigger::HandleWellKnown404).await;
+        match find(&err) {
+            Error::Resolution(ResolutionError::NoDid { handle, reason, .. }) => {
+                assert_eq!(handle, HANDLE);
+                match reason {
+                    NoDidReason::WellKnownStatus { status, url, .. } => {
+                        assert_eq!(*status, 404);
+                        assert!(url.ends_with("/.well-known/atproto-did"), "{url}");
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+        let (err, _) = typed(Trigger::HandleTxtNotADid).await;
+        match find(&err) {
+            Error::Resolution(ResolutionError::NoDid { handle, reason, .. }) => {
+                assert_eq!(handle, HANDLE);
+                assert!(
+                    matches!(reason, NoDidReason::TxtRecordNotADid { value, .. } if value == "not-a-did"),
+                    "{reason:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let (err, _) = typed(Trigger::HandleWellKnownNotADid).await;
+        match find(&err) {
+            Error::Resolution(ResolutionError::NoDid { handle, reason, .. }) => {
+                assert_eq!(handle, HANDLE);
+                assert!(
+                    matches!(reason, NoDidReason::WellKnownNotADid),
+                    "{reason:?}"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -811,6 +890,7 @@ mod typed {
                 failure,
                 sub,
                 status,
+                ..
             } => {
                 assert_eq!(*failure, RefreshFailure::SessionInvalid);
                 assert_eq!(sub, &w.fake.did());

@@ -45,6 +45,70 @@ use crate::token::RefreshFailure;
 ///
 /// Reached from an `anyhow::Error` with [`Error::find`]. `Display` is exactly
 /// the message the error always had.
+///
+/// **Every decision's shape may grow.** The enums are `#[non_exhaustive]`,
+/// and so are their struct-like variants: a caller matches them with `..`
+/// and never builds one, so a field added later breaks no caller. Each of
+/// these fails to compile outside calamus:
+///
+/// ```compile_fail
+/// // An exhaustive match on RefreshFailure.
+/// fn f(x: calamus::token::RefreshFailure) -> u8 {
+///     match x {
+///         calamus::token::RefreshFailure::Transient => 0,
+///         calamus::token::RefreshFailure::SessionInvalid => 1,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// // A field-exhaustive pattern on Ssrf.
+/// fn f(e: &calamus::Error) {
+///     if let calamus::Error::Ssrf { host, ip } = e { let _ = (host, ip); }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(e: &calamus::Error) {
+///     if let calamus::Error::RedirectRefused { status, url, refusal } = e {
+///         let _ = (status, url, refusal);
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(e: &calamus::Error) {
+///     if let calamus::Error::Refresh { failure, sub, status } = e {
+///         let _ = (failure, sub, status);
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn f(e: &calamus::Error) {
+///     if let calamus::Error::NoSession { sub, gone } = e { let _ = (sub, gone); }
+/// }
+/// ```
+///
+/// With `..`, each of them compiles:
+///
+/// ```
+/// fn f(e: &calamus::Error) -> bool {
+///     matches!(
+///         e,
+///         calamus::Error::Ssrf { .. }
+///             | calamus::Error::RedirectRefused { .. }
+///             | calamus::Error::Refresh { .. }
+///             | calamus::Error::NoSession { .. }
+///     )
+/// }
+/// fn g(x: calamus::token::RefreshFailure) -> u8 {
+///     match x {
+///         calamus::token::RefreshFailure::Transient => 0,
+///         _ => 1,
+///     }
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -53,6 +117,7 @@ pub enum Error {
     /// IP literal it is that IP (unbracketed), otherwise the name that
     /// resolved to `ip`.
     #[error("{}", ssrf_message(host, ip))]
+    #[non_exhaustive]
     Ssrf {
         /// The host as written in the URL (an IP literal, or a name).
         host: String,
@@ -62,6 +127,7 @@ pub enum Error {
 
     /// A redirect (or other `3xx`) was refused rather than followed.
     #[error("{}", redirect_message(*status, url, refusal))]
+    #[non_exhaustive]
     RedirectRefused {
         /// The response status.
         status: u16,
@@ -92,6 +158,7 @@ pub enum Error {
     /// removed; the user must log in again) or [`RefreshFailure::Transient`] (it
     /// was left intact).
     #[error("{}", refresh_message(*failure, sub, *status))]
+    #[non_exhaustive]
     Refresh {
         /// What the failure means for the session.
         failure: RefreshFailure,
@@ -103,6 +170,7 @@ pub enum Error {
 
     /// There is no session for `sub` (or it went away while being used).
     #[error("{}", no_session_message(sub, gone))]
+    #[non_exhaustive]
     NoSession {
         /// The subject asked for.
         sub: String,
@@ -143,11 +211,18 @@ impl Error {
 impl From<anyhow::Error> for Error {
     /// The variant, when `err` IS a calamus error with nothing above it;
     /// otherwise [`Error::Other`], keeping its context and chain (whose `Display`
-    /// is then exactly `err`'s).
+    /// and `{:#}` are then exactly `err`'s). A calamus error under context is
+    /// `Other` (still found inside it with [`Error::find`]): `downcast` alone
+    /// would see through `.context(...)` and drop those layers.
     fn from(err: anyhow::Error) -> Self {
-        match err.downcast::<Error>() {
-            Ok(typed) => typed,
-            Err(err) => Error::Other(err),
+        // The outermost cause is the error itself, or the outermost context.
+        if err.chain().next().is_some_and(|c| c.is::<Error>()) {
+            match err.downcast::<Error>() {
+                Ok(typed) => typed,
+                Err(err) => Error::Other(err),
+            }
+        } else {
+            Error::Other(err)
         }
     }
 }
@@ -204,6 +279,18 @@ pub enum ResolutionError {
     /// against it.
     #[error("DID document claims no handle; cannot verify bidirectionally")]
     NoClaimedHandle,
+    /// **The handle names no DID**: a typo, or an account that does not
+    /// exist (as opposed to an outage, which stays an untyped error: a
+    /// resolver failure, a fetch that failed, a `5xx`). `handle` is the handle
+    /// looked up (normalized).
+    #[error("{reason}")]
+    #[non_exhaustive]
+    NoDid {
+        /// The handle looked up.
+        handle: String,
+        /// Where it came up empty.
+        reason: NoDidReason,
+    },
     /// The DID document claims another handle than the one resolved.
     #[error("DID document claims handle {claimed:?}, not {wanted:?}")]
     HandleMismatch {
@@ -212,6 +299,33 @@ pub enum ResolutionError {
         /// The handle that was resolved (normalized).
         wanted: String,
     },
+}
+
+/// Where a handle came up without a DID.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum NoDidReason {
+    /// No `_atproto` TXT record, and `/.well-known/atproto-did` answered a
+    /// `4xx` (a `404`: nothing is served for that handle).
+    #[error("{url} returned status {status}")]
+    #[non_exhaustive]
+    WellKnownStatus {
+        /// The well-known URL.
+        url: String,
+        /// Its status (`400..500`).
+        status: u16,
+    },
+    /// The `_atproto` TXT record's `did=` value is not a DID.
+    #[error("_atproto TXT record does not contain a usable DID: {value:?}")]
+    #[non_exhaustive]
+    TxtRecordNotADid {
+        /// The value after `did=`.
+        value: String,
+    },
+    /// `/.well-known/atproto-did` answered `200` with something that is not
+    /// a DID.
+    #[error("/.well-known/atproto-did did not contain a usable DID")]
+    WellKnownNotADid,
 }
 
 /// What is wrong with a handle.
@@ -255,6 +369,24 @@ pub enum DiscoveryError {
         /// The issuer the PDS names now.
         discovered: String,
         /// The issuer the grant was issued by.
+        expected: String,
+    },
+    /// **The stored session moved, not the PDS.** The row a refresh re-read
+    /// under its lock belongs to another authorization server than the one
+    /// its context was discovered for, while the row read before the lock
+    /// was that server's: a re-login at another authorization server landed
+    /// in between. Nothing was sent. Re-read the session and discover ITS
+    /// issuer (unlike [`DiscoveryError::IssuerMismatch`], this says nothing
+    /// about the PDS).
+    #[error(
+        "the stored session now belongs to a different authorization server ({stored:?}) \
+         than the one this refresh was discovered for ({expected:?}), after a re-login; \
+         re-read the session and discover its issuer"
+    )]
+    StoredIssuerChanged {
+        /// The issuer of the row on record now.
+        stored: String,
+        /// The issuer the context was discovered for.
         expected: String,
     },
     /// The authorization-server metadata claims another issuer than the one it
@@ -585,6 +717,44 @@ mod tests {
                 "DID document claims no handle; cannot verify bidirectionally",
             ),
             (
+                ResolutionError::NoDid {
+                    handle: "a.test".into(),
+                    reason: NoDidReason::WellKnownStatus {
+                        url: "https://a.test/.well-known/atproto-did".into(),
+                        status: 404,
+                    },
+                }
+                .into(),
+                "https://a.test/.well-known/atproto-did returned status 404",
+            ),
+            (
+                ResolutionError::NoDid {
+                    handle: "a.test".into(),
+                    reason: NoDidReason::TxtRecordNotADid { value: "x".into() },
+                }
+                .into(),
+                "_atproto TXT record does not contain a usable DID: \"x\"",
+            ),
+            (
+                ResolutionError::NoDid {
+                    handle: "a.test".into(),
+                    reason: NoDidReason::WellKnownNotADid,
+                }
+                .into(),
+                "/.well-known/atproto-did did not contain a usable DID",
+            ),
+            (
+                DiscoveryError::StoredIssuerChanged {
+                    stored: "https://b.test".into(),
+                    expected: "https://a.test".into(),
+                }
+                .into(),
+                "the stored session now belongs to a different authorization server \
+                 (\"https://b.test\") than the one this refresh was discovered for \
+                 (\"https://a.test\"), after a re-login; re-read the session and discover its \
+                 issuer",
+            ),
+            (
                 ResolutionError::HandleMismatch {
                     claimed: "b.test".into(),
                     wanted: "a.test".into(),
@@ -753,6 +923,39 @@ mod tests {
             assert_eq!(format!("{any:#}"), want);
             assert_eq!(any.chain().count(), 1, "{want}");
         }
+    }
+
+    /// **A typed error under context converts to `Other`, text intact.** The
+    /// variant comes back only when nothing is above it; `downcast` alone would
+    /// see through the context layers and drop them.
+    #[test]
+    fn a_typed_error_under_context_converts_to_other_with_identical_text() {
+        let err = anyhow::Error::from(Error::from(CallbackError::NoPendingLogin))
+            .context("completing the login")
+            .context("handling /oauth/callback");
+        let before = format!("{err:#}");
+        assert!(matches!(
+            Error::find(&err),
+            Some(Error::Callback(CallbackError::NoPendingLogin))
+        ));
+        let converted = Error::from(err);
+        assert!(matches!(converted, Error::Other(_)), "{converted:?}");
+        assert_eq!(format!("{converted:#}"), before);
+        assert_eq!(converted.to_string(), "handling /oauth/callback");
+        // The variant is still found inside it.
+        let Error::Other(inner) = &converted else {
+            unreachable!()
+        };
+        assert!(matches!(
+            Error::find(inner),
+            Some(Error::Callback(CallbackError::NoPendingLogin))
+        ));
+        // With nothing above it, the variant itself.
+        let bare = anyhow::Error::from(Error::from(CallbackError::NoPendingLogin));
+        assert!(matches!(
+            Error::from(bare),
+            Error::Callback(CallbackError::NoPendingLogin)
+        ));
     }
 
     /// `Other` is the whole error, context and chain.

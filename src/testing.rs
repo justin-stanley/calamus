@@ -1070,13 +1070,15 @@ pub mod store_contract {
     /// round. Needs a multi-threaded runtime with at least two workers
     /// (`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` or more),
     /// or the takes never overlap; `store` must be empty. A losing take must
-    /// return `Ok(None)`: an error fails the step, saying so.
+    /// return `Ok(None)`: an error fails the step, saying so. `tasks` must be
+    /// at least 2 and `rounds` at least 1, or the step refuses to run.
     pub async fn pending_take_is_atomic<P: PendingLoginStore + 'static>(
         store: std::sync::Arc<P>,
         tasks: usize,
         rounds: usize,
     ) {
         assert_multi_thread("pending_take_is_atomic");
+        assert_a_race("pending_take_is_atomic", tasks, rounds);
         for round in 0..rounds {
             let state = format!("s-atomic-{round}");
             store.put(&pending_login(&state, NOW + 600)).await.unwrap();
@@ -1129,19 +1131,48 @@ pub mod store_contract {
         );
     }
 
+    /// A race needs at least two racers and at least one round: one task
+    /// never contends, and zero rounds run nothing, so either passes for any
+    /// store.
+    fn assert_a_race(step: &str, tasks: usize, rounds: usize) {
+        assert!(
+            tasks >= 2,
+            "{step}: a race needs at least two tasks, got {tasks}; with one it passes vacuously"
+        );
+        assert!(
+            rounds >= 1,
+            "{step}: needs at least one round, got {rounds}; with none it tests nothing"
+        );
+    }
+
     /// A store's answer to one racing call, or a panic that says what is
     /// wrong when it errored: a lost race is an answer (`Ok(false)`, or
-    /// `Ok(None)` for `take`), never an error. A serializable transaction
-    /// that loses (Postgres `40001`, SQLite `SQLITE_BUSY`) must be retried
-    /// inside the store or reported as the loss it is; a caller cannot tell
-    /// an error from a broken store, and the refresh path fails the request.
+    /// `Ok(None)` for `take`), never an error.
+    ///
+    /// **Only a failure that PROVES another writer committed may be reported
+    /// as the loss**: e.g. Postgres `40001` ("could not serialize access due
+    /// to concurrent update") from a version-guarded `UPDATE`/`DELETE` under
+    /// `REPEATABLE READ`, which is raised exactly because the row was changed
+    /// by a committed transaction. **A lock or busy timeout (SQLite
+    /// `SQLITE_BUSY`, `database is locked`, a Postgres lock timeout or
+    /// deadlock) proves nothing** about the row: retry it inside the store,
+    /// or return it as an error. Reporting it as `Ok(false)` tells the
+    /// refresh path that another writer replaced the row, and it then
+    /// revokes the refresh token the server has just rotated to, which may be
+    /// the grant's only live one: a briefly locked database logs the user
+    /// out. An error makes the refresh fail its request and revoke nothing.
+    /// Here, under real contention, a correct store answers every racing call;
+    /// an error is a store that does neither.
     fn race_answer<T>(step: &str, call: &str, lost: &str, answer: anyhow::Result<T>) -> T {
         match answer {
             Ok(answer) => answer,
             Err(err) => panic!(
                 "{step}: {call} returned an error under contention ({err:#}). A call that \
-                 loses the race must report {lost}, not an error; if this is a \
-                 serialization failure, retry it inside the store or map it to the loss"
+                 loses the race must report {lost}, not an error. Map a failure to the loss \
+                 ONLY when it proves another writer committed (e.g. Postgres 40001 from a \
+                 version-guarded UPDATE); a lock or busy timeout (SQLITE_BUSY) proves \
+                 nothing and must be retried inside the store (or, outside a race, returned \
+                 as an error), never reported as {lost}"
             ),
         }
     }
@@ -1163,14 +1194,17 @@ pub mod store_contract {
     /// a refresh and a sign-out both "winning", which is a resurrection. Needs
     /// a multi-threaded runtime with at least two workers; `store` must be
     /// empty and is left empty. A losing write must return `Ok(false)`: an
-    /// error (a serialization failure) fails the step, saying so.
+    /// error fails the step, saying so. `Ok(false)` is reserved for a row that
+    /// really changed: a lock or busy timeout must be retried inside the
+    /// store, never reported as `Ok(false)` (see the panic's guidance).
+    /// `tasks` must be at least 2 and `rounds` at least 1.
     pub async fn sessions_conditional_writes_are_atomic<S: SessionStore + 'static>(
         store: std::sync::Arc<S>,
         tasks: usize,
         rounds: usize,
     ) {
         assert_multi_thread("sessions_conditional_writes_are_atomic");
-        assert!(tasks >= 2, "a race needs at least two writers");
+        assert_a_race("sessions_conditional_writes_are_atomic", tasks, rounds);
         for (race, label) in ["update/update", "delete/delete", "update/delete"]
             .into_iter()
             .enumerate()

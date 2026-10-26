@@ -695,7 +695,8 @@ fn pending_expiry(now: i64, par_expires_in: i64) -> i64 {
 }
 
 /// Refuse a signing key that an inline JWKS does not publish: no member with
-/// the key's RFC 7638 thumbprint under the key's `kid`.
+/// the key's RFC 7638 thumbprint under the key's `kid`, whose `use` (if
+/// present) is `sig` and whose `alg` (if present) is `ES256`.
 ///
 /// The authorization server picks the verification key by the assertion's
 /// `kid` and verifies against the published one, so a key published under
@@ -710,7 +711,14 @@ fn require_published(jwks: &serde_json::Value, key: &SigningKey) -> Result<()> {
         .into_iter()
         .flatten()
         .any(|member| {
+            // `use` and `alg` are optional (RFC 7517 §4.2, §4.4), but when
+            // present they must allow an ES256 signature.
+            let allows = |field: &str, want: &str| {
+                member.get(field).is_none_or(|v| v.as_str() == Some(want))
+            };
             member.get("kid").and_then(serde_json::Value::as_str) == Some(key.kid())
+                && allows("use", "sig")
+                && allows("alg", "ES256")
                 && SigningKey::public_thumbprint_of(&member.to_string())
                     .ok()
                     .as_deref()
@@ -3584,6 +3592,54 @@ mod tests {
             .push(key.public_jwk().unwrap());
         Client::new(inline(both), Some(copy()), "https://plc.directory")
             .expect("a key the inline JWKS publishes");
+    }
+
+    /// **The published member must be usable for ES256 signatures.** A
+    /// member that matches the key but says `use: enc`, or `alg` other than
+    /// ES256, is one a server will not verify an ES256 assertion against.
+    /// Either absent is fine (both are optional in RFC 7517).
+    #[test]
+    fn a_client_refuses_a_published_key_not_for_es256_signatures() {
+        let inline = |jwks: serde_json::Value| {
+            ClientMetadata::confidential(
+                url::Url::parse("https://app.example.com/oauth/client-metadata.json").unwrap(),
+                vec![url::Url::parse("https://app.example.com/oauth/callback").unwrap()],
+                "atproto",
+                "App",
+                None,
+                Jwks::Inline(jwks),
+            )
+            .unwrap()
+        };
+        let key = SigningKey::generate("k1");
+        let copy = || SigningKey::from_jwk_json(&key.to_jwk_json().unwrap(), "k1").unwrap();
+        let with = |field: &str, value: Option<&str>| {
+            let mut jwks = key.jwks_document().unwrap();
+            let member = jwks["keys"][0].as_object_mut().unwrap();
+            match value {
+                Some(v) => member.insert(field.into(), v.into()),
+                None => member.remove(field),
+            };
+            jwks
+        };
+
+        for (field, value) in [("use", "enc"), ("alg", "RS256"), ("alg", "ES384")] {
+            let err = Client::new(
+                inline(with(field, Some(value))),
+                Some(copy()),
+                "https://plc.directory",
+            )
+            .expect_err(&format!("a member with {field} {value} was accepted"));
+            assert!(format!("{err:#}").contains("inline JWKS"), "{err:#}");
+        }
+        for field in ["use", "alg"] {
+            Client::new(
+                inline(with(field, None)),
+                Some(copy()),
+                "https://plc.directory",
+            )
+            .unwrap_or_else(|e| panic!("a member without {field} was refused: {e:#}"));
+        }
     }
 
     /// The client's identity comes from its metadata, so what it sends and
