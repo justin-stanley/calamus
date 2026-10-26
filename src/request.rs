@@ -256,8 +256,10 @@ pub struct DpopRequest<'a> {
 ///
 /// The request goes through `fetcher`'s SSRF guard, redirects refused. The
 /// origin's stored nonce (from `nonces`) rides on the first attempt, and every
-/// nonce a response offers is stored back. `now` (Unix seconds) is every
-/// proof's `iat` and the nonce's write time.
+/// nonce a response offers is stored back. `now` (Unix seconds) is the time
+/// at the call; each proof's `iat` and each nonce's write time is `now` plus
+/// what has elapsed since, so a retry minted after a slow first attempt is not
+/// already stale.
 pub async fn send_with_dpop(
     fetcher: &Fetcher,
     nonces: &impl NonceStore,
@@ -274,10 +276,18 @@ pub async fn send_with_dpop(
     } = *request;
     let method = body.method();
     let origin = origin_of(url)?;
+    let clock = crate::Elapsing::from(now);
     let mut nonce = nonces.get(&origin).await?;
 
     for attempt in 0..2 {
-        let proof = dpop::proof(key, method, url, access_token, nonce.as_deref(), now)?;
+        let proof = dpop::proof(
+            key,
+            method,
+            url,
+            access_token,
+            nonce.as_deref(),
+            clock.now(),
+        )?;
         let headers = request_headers(&proof, access_token)?;
 
         let response = match body {
@@ -317,7 +327,7 @@ pub async fn send_with_dpop(
 
         if let Some(offered) = &offered {
             if Some(offered) != nonce.as_ref() {
-                nonces.put(&origin, offered, now).await?;
+                nonces.put(&origin, offered, clock.now()).await?;
             }
         }
 
@@ -796,10 +806,81 @@ mod tests {
             nonces.get(&origin).await.unwrap().as_deref(),
             Some("fresh-2")
         );
-        // Both proofs carry the caller's time.
-        for req in &reqs {
-            assert_eq!(proof_claims(req)["iat"], NOW);
+        // Both proofs carry the caller's time, advanced by what has elapsed
+        // since the call began (well under the window here): anchored to `now`,
+        // never to the wall clock, and never earlier on the retry.
+        let iats: Vec<i64> = reqs
+            .iter()
+            .map(|r| proof_claims(r)["iat"].as_i64().unwrap())
+            .collect();
+        assert!(
+            iats.iter().all(|iat| (NOW..NOW + 5).contains(iat)),
+            "{iats:?} is not anchored to the supplied now"
+        );
+        assert!(iats[1] >= iats[0], "{iats:?}");
+    }
+
+    /// A [`MemoryNonces`] whose `put` moves tokio's clock forward by `by`:
+    /// time passing between a challenge and its retry, deterministically (the
+    /// clock is paused only for the advance, never across network I/O).
+    struct AdvancingNonces {
+        inner: MemoryNonces,
+        by: std::time::Duration,
+    }
+
+    impl NonceStore for AdvancingNonces {
+        async fn get(&self, origin: &str) -> anyhow::Result<Option<String>> {
+            self.inner.get(origin).await
         }
+
+        async fn put(&self, origin: &str, nonce: &str, now: i64) -> anyhow::Result<()> {
+            self.inner.put(origin, nonce, now).await?;
+            tokio::time::pause();
+            tokio::time::advance(self.by).await;
+            tokio::time::resume();
+            Ok(())
+        }
+    }
+
+    /// **A retry's proof carries the time it is minted.** The caller's `now`
+    /// is the time at the call; when the first attempt takes a minute, the
+    /// retry minted after it is a minute later, or a server with a tight `iat`
+    /// window rejects it as stale.
+    #[tokio::test]
+    async fn a_retry_minted_after_time_passes_carries_the_later_iat() {
+        let (fetcher, origin, log) = authorization_server(vec![(
+            "/token",
+            vec![use_dpop_nonce("n-1"), TestResponse::json(200, "{}")],
+        )])
+        .await;
+        let nonces = AdvancingNonces {
+            inner: MemoryNonces::new(),
+            by: std::time::Duration::from_secs(60),
+        };
+        let key = SigningKey::generate("k");
+        let url = format!("{origin}/token");
+
+        let outcome = send_with_dpop(
+            &fetcher,
+            &nonces,
+            &form_post(&url, &key, &[("grant_type", "refresh_token")]),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, 200);
+
+        let reqs = log.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+        let iats: Vec<i64> = reqs
+            .iter()
+            .map(|r| proof_claims(r)["iat"].as_i64().unwrap())
+            .collect();
+        assert!((NOW..NOW + 5).contains(&iats[0]), "{iats:?}");
+        assert!(
+            (NOW + 60..NOW + 65).contains(&iats[1]),
+            "the retry reused the call's time: {iats:?}"
+        );
     }
 
     /// **The client assertion is replayed verbatim on a nonce retry; only the

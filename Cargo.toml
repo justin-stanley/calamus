@@ -47,7 +47,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "crypto", "ring"] }
-tokio = { version = "1.45", features = ["io-util", "macros", "net", "process", "rt", "time"] }
+tokio = { version = "1.45", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [features]
@@ -65,7 +65,7 @@ revoke = []
 # host overrides, which deliberately bypass the SSRF guard for named hosts).
 # Never enable it outside [dev-dependencies]; scripts/ci.sh proves it is absent
 # from a default build.
-test-util = ["dep:rcgen", "dep:tokio-rustls", "tokio/io-util", "tokio/macros", "tokio/rt"]
+test-util = ["dep:rcgen", "dep:tokio-rustls", "tokio/io-util", "tokio/macros", "tokio/rt", "tokio/sync"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -57,8 +57,9 @@ pub trait NonceStore: Send + Sync {
 ///
 /// FeatherReader's `store::PendingAuth`, with `auth_method` typed (FeatherReader
 /// stores its wire name, [`AuthMethod::as_str`], and parses it back with
-/// `FromStr`). `pkce_verifier` and `dpop_key_jwk` are secrets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `FromStr`). `pkce_verifier` and `dpop_key_jwk` are secrets, and `Debug`
+/// prints them (and the binding hash) as `<redacted>`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingLogin {
     /// The `state` pushed in PAR; the key the callback finds this by.
     pub state: String,
@@ -128,8 +129,8 @@ pub trait PendingLoginStore: Send + Sync {
 /// An authenticated account's tokens.
 ///
 /// FeatherReader's `store::OAuthSession`. `dpop_key_jwk`, `access_token` and
-/// `refresh_token` are secrets.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `refresh_token` are secrets, and `Debug` prints them as `<redacted>`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     /// The account's DID; the key a session is stored under.
     pub sub: String,
@@ -152,6 +153,46 @@ pub struct Session {
     pub expires_at: Option<i64>,
 }
 
+/// What `Debug` prints in place of a secret.
+const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for PendingLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLogin")
+            .field("state", &self.state)
+            .field("browser_binding_hash", &REDACTED)
+            .field("pkce_verifier", &REDACTED)
+            .field("dpop_key_jwk", &REDACTED)
+            .field("issuer", &self.issuer)
+            .field("pds_url", &self.pds_url)
+            .field("did", &self.did)
+            .field("auth_method", &self.auth_method)
+            .field("auth_kid", &self.auth_kid)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("requested_scope", &self.requested_scope)
+            .field("request_uri", &self.request_uri)
+            .field("app_return_to", &self.app_return_to)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("sub", &self.sub)
+            .field("issuer", &self.issuer)
+            .field("aud", &self.aud)
+            .field("dpop_key_jwk", &REDACTED)
+            .field("access_token", &REDACTED)
+            .field("refresh_token", &REDACTED)
+            .field("token_type", &self.token_type)
+            .field("granted_scope", &self.granted_scope)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Sessions, one per subject DID.
 ///
 /// The refresh and sign-out races are decided here, by the two conditional
@@ -170,6 +211,12 @@ pub trait SessionStore: Send + Sync {
     /// stores identical values (FeatherReader's is the row's ciphertexts, which
     /// a write re-encrypts under a fresh nonce). Opaque to calamus: it is only
     /// ever compared, and handed back to the store that issued it.
+    ///
+    /// **Never reused for a subject**, including across a delete and a
+    /// re-insert: a version read before a sign-out must not match the row a
+    /// later login writes, even with identical values (ABA). A counter per row
+    /// that restarts at 1 on insert breaks this; a counter per store, a random
+    /// value, or FeatherReader's fresh-nonce ciphertexts do not.
     ///
     /// `Sync` as well as `Send` because the refresh and sign-out futures hold a
     /// reference to one across an await.
@@ -217,6 +264,13 @@ pub trait SessionStore: Send + Sync {
 /// For a login that only establishes who the user is (sign in with atproto)
 /// and never calls their PDS: the tokens are not wanted, so nothing should
 /// hold them. A refresh or sign-out against it finds no session.
+///
+/// **Discarding the tokens does not end the grant.** The authorization server
+/// still holds it, and the refresh token stays live there until it expires.
+/// Nothing can leak from a store that holds nothing, but a caller that wants
+/// the grant gone should revoke it once the identity is established: keep the
+/// [`Session`] the login returned for that one call
+/// ([`crate::revoke::revoke_tokens`]), then drop it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Discard;
 
@@ -314,9 +368,18 @@ pub mod memory {
     /// Unbounded by itself, and its writes are pre-authentication (see
     /// [`PendingLoginStore`]): a long-running caller should call
     /// [`MemoryPendingLogins::sweep`] periodically.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct MemoryPendingLogins {
         logins: Mutex<HashMap<String, PendingLogin>>,
+    }
+
+    /// The count only: the rows hold secrets.
+    impl std::fmt::Debug for MemoryPendingLogins {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MemoryPendingLogins")
+                .field("pending", &lock(&self.logins).len())
+                .finish()
+        }
     }
 
     impl MemoryPendingLogins {
@@ -370,10 +433,19 @@ pub mod memory {
 
     /// [`SessionStore`] in memory. Each conditional write is one comparison and
     /// one map operation under the lock, so it is atomic.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub struct MemorySessions {
         /// sub -> (session, the write that produced it).
         sessions: Mutex<HashMap<String, (Session, MemoryVersion)>>,
+    }
+
+    /// The count only: the rows hold secrets.
+    impl std::fmt::Debug for MemorySessions {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("MemorySessions")
+                .field("sessions", &lock(&self.sessions).len())
+                .finish()
+        }
     }
 
     impl MemorySessions {
@@ -503,6 +575,17 @@ mod tests {
         crate::testing::store_contract::sessions(&MemorySessions::new()).await;
     }
 
+    /// `take` stays single-use under real parallelism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn memory_pending_logins_take_is_atomic_across_threads() {
+        crate::testing::store_contract::pending_take_is_atomic(
+            std::sync::Arc::new(MemoryPendingLogins::new()),
+            8,
+            200,
+        )
+        .await;
+    }
+
     /// The contract suite against the in-memory pending-login store.
     #[tokio::test]
     async fn memory_pending_logins_meet_the_store_contract() {
@@ -557,6 +640,59 @@ mod tests {
         assert!(store.take("live", NOW).await?.is_some());
         assert!(store.take("old", NOW - 10).await?.is_none());
         assert!(store.take("edge", NOW - 10).await?.is_none());
+        Ok(())
+    }
+
+    /// **No secret reaches a `Debug` rendering.** Sessions and pending logins
+    /// end up in logs through `{:?}` (an `anyhow` context, a `tracing` field, a
+    /// test failure); the tokens, the PKCE verifier and the private DPoP JWK
+    /// must not. The non-secret identifiers stay, or the output is useless.
+    #[tokio::test]
+    async fn debug_output_redacts_every_secret() -> anyhow::Result<()> {
+        let session = Session {
+            dpop_key_jwk: r#"{"kty":"EC","d":"PRIVATE-D"}"#.into(),
+            access_token: "SECRET-ACCESS".into(),
+            refresh_token: "SECRET-REFRESH".into(),
+            ..a_session()
+        };
+        let login = PendingLogin {
+            pkce_verifier: "SECRET-VERIFIER".into(),
+            dpop_key_jwk: r#"{"kty":"EC","d":"PENDING-D"}"#.into(),
+            ..a_login()
+        };
+        let sessions = MemorySessions::new();
+        sessions.put(&session).await?;
+        let logins = MemoryPendingLogins::new();
+        logins.put(&login).await?;
+
+        let rendered = [
+            format!("{session:?}"),
+            format!("{session:#?}"),
+            format!("{login:?}"),
+            format!("{login:#?}"),
+            format!("{sessions:?}"),
+            format!("{logins:?}"),
+            format!("{:?}", sessions.get_versioned(&session.sub).await?),
+        ];
+        for shown in &rendered {
+            for secret in [
+                "SECRET-ACCESS",
+                "SECRET-REFRESH",
+                "PRIVATE-D",
+                "SECRET-VERIFIER",
+                "PENDING-D",
+            ] {
+                assert!(!shown.contains(secret), "{secret} in {shown}");
+            }
+        }
+        assert!(rendered[0].contains(&session.sub) && rendered[0].contains(&session.issuer));
+        assert!(rendered[0].contains("<redacted>"), "{}", rendered[0]);
+        assert!(rendered[2].contains(&login.state) && rendered[2].contains(&login.did));
+        assert!(
+            rendered[4].contains('1'),
+            "the store should show its count: {}",
+            rendered[4]
+        );
         Ok(())
     }
 

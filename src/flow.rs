@@ -230,7 +230,10 @@ pub fn known_error_slug(raw: &str) -> &'static str {
 }
 
 /// What the authorization server sent back to the redirect URI.
-#[derive(Debug, Default, Clone)]
+///
+/// `Debug` prints `code` (and a JARM `response`, which carries one) as
+/// `<redacted>`: with the PKCE verifier, the code is redeemable.
+#[derive(Default, Clone)]
 pub struct CallbackParams {
     /// The authorization code.
     pub code: Option<String>,
@@ -244,6 +247,20 @@ pub struct CallbackParams {
     pub error_description: Option<String>,
     /// JARM. Unsupported, and its presence is a refusal rather than a parse.
     pub response: Option<String>,
+}
+
+impl std::fmt::Debug for CallbackParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("CallbackParams")
+            .field("code", &redacted(&self.code))
+            .field("state", &self.state)
+            .field("iss", &self.iss)
+            .field("error", &self.error)
+            .field("error_description", &self.error_description)
+            .field("response", &redacted(&self.response))
+            .finish()
+    }
 }
 
 /// Validate a callback and return the authorization code.
@@ -879,6 +896,22 @@ mod tests {
         assert!(
             rendered.contains("browser-binding"),
             "reported the response before checking the browser: {rendered}"
+        );
+    }
+
+    /// The authorization code is a credential (with the PKCE verifier it is
+    /// redeemable), so `Debug` must not print it.
+    #[test]
+    fn callback_params_debug_redacts_the_code() {
+        let params = CallbackParams {
+            code: Some("SECRET-CODE".into()),
+            ..ok_params()
+        };
+        let shown = format!("{params:?}");
+        assert!(!shown.contains("SECRET-CODE"), "{shown}");
+        assert!(
+            shown.contains("state-value") && shown.contains(ISSUER),
+            "{shown}"
         );
     }
 

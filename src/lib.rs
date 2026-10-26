@@ -31,6 +31,37 @@ pub const MAX_ERROR_BODY: usize = 10 * 1024;
 pub fn error_body_worth_parsing(body: &[u8]) -> bool {
     !body.is_empty() && body.len() <= MAX_ERROR_BODY
 }
+/// The caller's `now`, advanced by the time elapsed since it was handed in.
+///
+/// Every function here takes the time as `now` (Unix seconds) instead of reading
+/// a clock, so tests can pin it. But one call can await for a long time (a
+/// refresh lock, a token request plus its nonce retry, a revocation, several
+/// sign-out attempts), and a proof or client assertion minted at the end must
+/// carry the time it is MINTED, not the time the call began. So each such
+/// function captures this at entry and reads [`Elapsing::now`] at every mint.
+/// It counts on tokio's clock, which a test can pause and advance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Elapsing {
+    base: i64,
+    start: tokio::time::Instant,
+}
+
+impl Elapsing {
+    /// Start counting from `now`.
+    pub(crate) fn from(now: i64) -> Self {
+        Self {
+            base: now,
+            start: tokio::time::Instant::now(),
+        }
+    }
+
+    /// `now` plus the whole seconds elapsed since [`Elapsing::from`].
+    pub(crate) fn now(&self) -> i64 {
+        let elapsed = i64::try_from(self.start.elapsed().as_secs()).unwrap_or(i64::MAX);
+        self.base.saturating_add(elapsed)
+    }
+}
+
 pub mod client_auth;
 pub mod discovery;
 pub mod dpop;

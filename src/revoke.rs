@@ -107,6 +107,12 @@ pub struct RevokeContext<'a> {
     /// Longest to wait on the authorization server before giving up. Injectable
     /// so the deadline can be TESTED without a five-second test.
     pub deadline: std::time::Duration,
+    /// The authorization server `revocation_endpoint` was discovered for. A
+    /// session whose issuer is any other is refused before anything is sent
+    /// ([`crate::discovery::same_issuer`]): another server answers 200 for a
+    /// token it does not know, so the grant stays live while this reports it
+    /// revoked, and its refresh token has been handed to that server.
+    pub issuer: &'a str,
 }
 
 /// Revoke a token set that has NO local row to delete — bounded by
@@ -154,9 +160,10 @@ pub async fn revoke_tokens(
 /// POST [`token_to_revoke`] to the revocation endpoint, with this client's
 /// credentials, proved with the session's own DPoP key. `Ok` on any 2xx.
 ///
-/// The endpoint must come from discovery for the session's OWN `(aud,
-/// issuer)`: a different authorization server answers 200 for a token it does
-/// not know, so the grant stays live while this reports it revoked.
+/// The endpoint must come from discovery for the session's OWN issuer, and
+/// `ctx.issuer` must say which issuer that was: a session from any other is
+/// refused with nothing sent. `now` is the time at the call; the assertion and
+/// the proof carry the time they are minted.
 pub async fn try_revoke(
     fetcher: &Fetcher,
     nonces: &impl NonceStore,
@@ -164,6 +171,9 @@ pub async fn try_revoke(
     session: &Session,
     now: i64,
 ) -> Result<()> {
+    let clock = crate::Elapsing::from(now);
+    // Before anything else: this sends the REFRESH TOKEN.
+    crate::discovery::same_issuer(ctx.issuer, &session.issuer)?;
     let endpoint = ctx.revocation_endpoint.ok_or_else(|| {
         anyhow::anyhow!("the authorization server advertises no revocation endpoint")
     })?;
@@ -178,7 +188,7 @@ pub async fn try_revoke(
                 key,
                 ctx.client_id,
                 &session.issuer,
-                now,
+                clock.now(),
             )?)
         }
         AuthMethod::None => None,
@@ -200,7 +210,7 @@ pub async fn try_revoke(
             body: DpopBody::Form(&form),
             retry: Retry::Allowed,
         },
-        now,
+        clock.now(),
     )
     .await?;
     // Every response, not just failures: a 2xx here is the evidence that
@@ -235,10 +245,13 @@ pub async fn try_revoke(
 /// PDS's timeouts to reach a delete that happens regardless is the wrong trade.
 /// Past the deadline the attempt is abandoned and the local session goes.
 ///
-/// `ctx.revocation_endpoint` must be the one discovered for the stored
-/// session's own issuer. A caller that discovers it per session (the endpoint
-/// is not stored on the session) uses [`sign_out_with`] and discovers inside
-/// the attempt, for the row each attempt actually read.
+/// `ctx.revocation_endpoint` must be the one discovered for `ctx.issuer`. A row
+/// re-read after a change can belong to another issuer (a re-login after a PDS
+/// migration): its tokens are then NOT sent to this endpoint; that attempt
+/// fails, and the row is deleted like any other whose revocation failed. A
+/// caller that discovers the endpoint per session (it is not stored on the
+/// session) uses [`sign_out_with`] and discovers inside the attempt, for the
+/// row each attempt actually read.
 #[cfg(feature = "revoke")]
 pub async fn sign_out(
     store: &impl SessionStore,
@@ -248,8 +261,11 @@ pub async fn sign_out(
     sub: &str,
     now: i64,
 ) -> Revocation {
+    // Each attempt revokes at ITS time: up to three of them, each bounded by
+    // the deadline, so the last can start well after `now`.
+    let clock = crate::Elapsing::from(now);
     sign_out_with(store, sub, ctx.deadline, |session| async move {
-        revoke_tokens(fetcher, nonces, ctx, &session, now).await
+        revoke_tokens(fetcher, nonces, ctx, &session, clock.now()).await
     })
     .await
 }
@@ -474,9 +490,20 @@ mod tests {
         String,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        revocation_server_replies(vec![reply]).await
+    }
+
+    /// [`revocation_server`] with successive replies (the last repeats).
+    async fn revocation_server_replies(
+        replies: Vec<TestResponse>,
+    ) -> (
+        Fetcher,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let (addr, log) = spawn_tls(move |_| {
             let mut r = std::collections::HashMap::new();
-            r.insert("/revoke".to_string(), vec![reply]);
+            r.insert("/revoke".to_string(), replies);
             r
         })
         .await;
@@ -496,7 +523,138 @@ mod tests {
             auth_method: AuthMethod::None,
             client_key: None,
             deadline: std::time::Duration::from_secs(5),
+            issuer: ISSUER,
         }
+    }
+
+    /// The issuer [`session`] belongs to.
+    const ISSUER: &str = "https://pds.example.com";
+
+    fn revoke_requests(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /revoke"))
+            .cloned()
+            .collect()
+    }
+
+    fn jwt_part(jwt: &str, idx: usize) -> serde_json::Value {
+        use base64::Engine as _;
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(idx).expect("malformed JWT"))
+                .expect("not base64url"),
+        )
+        .expect("not JSON")
+    }
+
+    fn form_param(raw: &str, name: &str) -> Option<String> {
+        let (_, body) = raw.split_once("\r\n\r\n").expect("no body");
+        url::form_urlencoded::parse(body.as_bytes())
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    }
+
+    fn keyed_session() -> (SigningKey, Session) {
+        let key = SigningKey::generate("session");
+        let session = Session {
+            dpop_key_jwk: key.to_jwk_json().unwrap(),
+            ..session("access-abc", "refresh-xyz")
+        };
+        (key, session)
+    }
+
+    /// **A revocation answers one nonce challenge, as an authorization-server
+    /// request, and proves without `ath`.** Two requests, the second with the
+    /// challenge's nonce, no access token on either.
+    #[tokio::test]
+    async fn a_revocation_answers_one_nonce_challenge_and_proves_without_ath() {
+        let (fetcher, endpoint, log) = revocation_server_replies(vec![
+            TestResponse::json(400, r#"{"error":"use_dpop_nonce"}"#)
+                .with_header("DPoP-Nonce", "revoke-nonce"),
+            TestResponse::json(200, "{}"),
+        ])
+        .await;
+        let (_, session) = keyed_session();
+
+        let outcome = revoke_tokens(
+            &fetcher,
+            &MemoryNonces::new(),
+            &public_ctx(&endpoint),
+            &session,
+            NOW,
+        )
+        .await;
+        assert_eq!(outcome, Revocation::Revoked);
+
+        let reqs = revoke_requests(&log);
+        assert_eq!(reqs.len(), 2, "{reqs:#?}");
+        let claims: Vec<_> = reqs.iter().map(|r| jwt_part(&dpop_proof(r), 1)).collect();
+        assert!(claims[0].get("nonce").is_none());
+        assert_eq!(claims[1]["nonce"], "revoke-nonce");
+        for (req, claims) in reqs.iter().zip(&claims) {
+            assert!(
+                claims.get("ath").is_none(),
+                "a revocation proof carried ath: {claims}"
+            );
+            assert!(
+                !req.to_ascii_lowercase().contains("\nauthorization:"),
+                "an access token was sent to the revocation endpoint: {req}"
+            );
+        }
+    }
+
+    /// **A confidential client's revocation assertion is for the session's
+    /// ISSUER**, not for the revocation endpoint's URL.
+    #[tokio::test]
+    async fn a_private_key_jwt_revocation_asserts_for_the_sessions_issuer() {
+        let (fetcher, endpoint, log) = revocation_server(TestResponse::json(200, "{}")).await;
+        let (_, session) = keyed_session();
+        let client_key = SigningKey::generate("client-1");
+        let client_id = "https://client.example/oauth-client-metadata.json";
+        let ctx = RevokeContext {
+            client_id,
+            auth_method: AuthMethod::PrivateKeyJwt,
+            client_key: Some(&client_key),
+            ..public_ctx(&endpoint)
+        };
+
+        let outcome = revoke_tokens(&fetcher, &MemoryNonces::new(), &ctx, &session, NOW).await;
+        assert_eq!(outcome, Revocation::Revoked);
+
+        let reqs = revoke_requests(&log);
+        let assertion = form_param(&reqs[0], "client_assertion").expect("no client_assertion");
+        crate::jwt::verify(&client_key, &assertion).expect("not signed by the client key");
+        let claims = jwt_part(&assertion, 1);
+        assert_eq!(claims["aud"], ISSUER, "{claims}");
+        assert_eq!(claims["iss"], client_id);
+    }
+
+    /// **A revocation refuses a session whose issuer is not the one the
+    /// endpoint was discovered for.** Another authorization server answers 200
+    /// for a token it does not know: reported revoked, grant live, and the
+    /// refresh token handed to the wrong server. Nothing is sent.
+    #[tokio::test]
+    async fn a_revocation_refuses_a_session_from_another_issuer() {
+        let (fetcher, endpoint, log) = revocation_server(TestResponse::json(200, "{}")).await;
+        let (_, session) = keyed_session();
+        let ctx = RevokeContext {
+            issuer: "https://other-as.example.com",
+            ..public_ctx(&endpoint)
+        };
+
+        let outcome = revoke_tokens(&fetcher, &MemoryNonces::new(), &ctx, &session, NOW).await;
+        match &outcome {
+            Revocation::Failed(reason) => {
+                assert!(
+                    reason.contains("different authorization server"),
+                    "{reason}"
+                )
+            }
+            other => panic!("another issuer's endpoint must be refused: {other:?}"),
+        }
+        assert!(log.lock().unwrap().is_empty(), "{:#?}", log.lock().unwrap());
     }
 
     /// **RFC 7009 §2.2: a 200 also means "that token was not recognised".** The
@@ -643,6 +801,7 @@ mod tests {
                 auth_method: AuthMethod::None,
                 client_key: None,
                 deadline: TEST_DEADLINE,
+                issuer: "https://pds.example.com",
             }
         }
 
@@ -971,6 +1130,104 @@ mod tests {
             .await;
             assert_eq!(outcome, Revocation::Revoked);
             assert_eq!(seen.lock().unwrap().len(), 1, "retried a row that was gone");
+        }
+
+        /// A [`MemorySessions`] in which `relogin` replaces the row during the
+        /// first revocation (just before its compare-and-delete): a re-login,
+        /// after a PDS migration, at ANOTHER authorization server.
+        struct ReloginDuringRevoke {
+            inner: MemorySessions,
+            relogin: std::sync::Mutex<Option<Session>>,
+        }
+
+        impl SessionStore for ReloginDuringRevoke {
+            type Version = <MemorySessions as SessionStore>::Version;
+
+            async fn get(&self, sub: &str) -> anyhow::Result<Option<Session>> {
+                self.inner.get(sub).await
+            }
+            async fn get_versioned(
+                &self,
+                sub: &str,
+            ) -> anyhow::Result<Option<(Session, Self::Version)>> {
+                self.inner.get_versioned(sub).await
+            }
+            async fn put(&self, session: &Session) -> anyhow::Result<()> {
+                self.inner.put(session).await
+            }
+            async fn update_if_unchanged(
+                &self,
+                session: &Session,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                self.inner.update_if_unchanged(session, version).await
+            }
+            async fn delete(&self, sub: &str) -> anyhow::Result<bool> {
+                self.inner.delete(sub).await
+            }
+            async fn delete_if_unchanged(
+                &self,
+                sub: &str,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                let relogin = self.relogin.lock().unwrap().take();
+                if let Some(relogin) = relogin {
+                    self.inner.put(&relogin).await?;
+                }
+                self.inner.delete_if_unchanged(sub, version).await
+            }
+        }
+
+        /// **A sign-out never sends a re-read grant from ANOTHER issuer to the
+        /// endpoint it was given.** The sign-out re-reads a row that changed
+        /// under it, and the re-read can be a new grant at a different
+        /// authorization server (a re-login after a PDS migration). Its refresh
+        /// token must not go to the old server's endpoint, which would answer
+        /// 200 for a token it does not know: reported revoked, grant live.
+        #[tokio::test]
+        async fn a_sign_out_does_not_send_a_re_login_at_another_issuer_to_the_old_endpoint() {
+            let (fetcher, endpoint, log) =
+                super::revocation_server(crate::testing::TestResponse::json(200, "{}")).await;
+            let store = ReloginDuringRevoke {
+                inner: MemorySessions::new(),
+                relogin: std::sync::Mutex::new(None),
+            };
+            stored(&store.inner).await;
+            *store.relogin.lock().unwrap() = Some(Session {
+                issuer: "https://as-other.test".into(),
+                dpop_key_jwk: SigningKey::generate("session").to_jwk_json().unwrap(),
+                ..session("access-moved", "refresh-moved")
+            });
+
+            let outcome = sign_out(
+                &store,
+                &fetcher,
+                &MemoryNonces::new(),
+                &RevokeContext {
+                    deadline: std::time::Duration::from_secs(5),
+                    ..ctx(Some(&endpoint))
+                },
+                DID,
+                NOW,
+            )
+            .await;
+
+            let revokes = super::revoke_requests(&log);
+            assert_eq!(revokes.len(), 1, "{revokes:#?}");
+            assert!(revokes[0].contains("token=refresh-xyz"), "{}", revokes[0]);
+            assert!(
+                !revokes.iter().any(|r| r.contains("refresh-moved")),
+                "the other issuer's refresh token reached the old endpoint: {revokes:#?}"
+            );
+            match &outcome {
+                Revocation::Failed(reason) => {
+                    assert!(
+                        reason.contains("different authorization server"),
+                        "{reason}"
+                    )
+                }
+                other => panic!("the moved grant was not revoked, so not Revoked: {other:?}"),
+            }
         }
 
         /// The sign-out future is `Send` for any stores. Compile-time.

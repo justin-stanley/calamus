@@ -80,32 +80,83 @@ pub fn apply_refresh(session: &Session, response: &TokenResponse, now: i64) -> R
 /// revoke the winner's freshly issued tokens along with it. The symptom is
 /// random, unreproducible logouts.
 ///
+/// **One shared instance per process.** The lock only serializes refreshes that
+/// go through the SAME `RefreshLocks` (clones share it): build one at startup
+/// and hand it to every [`valid_session`] call. A fresh `RefreshLocks` per
+/// request locks nothing.
+///
 /// **In-process only.** A second process is not covered, which is why the
 /// refresh path also re-reads the stored session on `invalid_grant` before
 /// concluding the grant is dead, and writes only over the row it read.
+///
+/// A subject's entry is dropped when its last holder releases it and nobody
+/// waits on it, so the map holds only subjects being refreshed right now.
 #[derive(Debug, Default, Clone)]
 pub struct RefreshLocks {
-    locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    locks: Arc<Mutex<LockMap>>,
+}
+
+type LockMap = HashMap<String, Arc<AsyncMutex<()>>>;
+
+/// Holds one subject's refresh lock; releases it when dropped.
+#[derive(Debug)]
+pub struct RefreshGuard {
+    /// `None` only inside `drop`, which releases it under the map lock.
+    guard: Option<OwnedMutexGuard<()>>,
+    entry: Arc<AsyncMutex<()>>,
+    locks: Arc<Mutex<LockMap>>,
+    sub: String,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
+        // Release first, under the map lock: a new caller clones the entry only
+        // under the map lock, so nothing can start waiting while we decide.
+        self.guard = None;
+        // What is left referencing this mutex: the map's copy and ours. Any
+        // more is a waiter (each holds a clone from the moment it asked), which
+        // still needs the entry.
+        if Arc::strong_count(&self.entry) == 2
+            && locks
+                .get(&self.sub)
+                .is_some_and(|in_map| Arc::ptr_eq(in_map, &self.entry))
+        {
+            locks.remove(&self.sub);
+        }
+    }
 }
 
 impl RefreshLocks {
+    /// How many subjects have a lock entry right now.
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.locks.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     /// Acquire the lock for one subject. Unrelated subjects never contend.
-    pub async fn lock(&self, sub: &str) -> OwnedMutexGuard<()> {
+    pub async fn lock(&self, sub: &str) -> RefreshGuard {
         let entry = {
             // Recover rather than panic: this gates every token refresh, so a
             // poisoned lock here would lock every user out until a restart.
             let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
             Arc::clone(locks.entry(sub.to_string()).or_default())
         };
-        entry.lock_owned().await
+        let guard = Arc::clone(&entry).lock_owned().await;
+        RefreshGuard {
+            guard: Some(guard),
+            entry,
+            locks: Arc::clone(&self.locks),
+            sub: sub.to_string(),
+        }
     }
 }
 
 /// What a refresh needs beyond the session itself.
 ///
-/// `token_endpoint` and `revocation_endpoint` must come from a discovery whose
-/// issuer was checked against the session's own ([`same_issuer`]): this path
-/// sends the REFRESH TOKEN.
+/// `token_endpoint` and `revocation_endpoint` must come from a discovery of
+/// `issuer`, and `issuer` must be the session's own ([`same_issuer`] is checked
+/// again before the request): this path sends the REFRESH TOKEN.
 pub struct RefreshContext<'a> {
     /// The authorization server's token endpoint.
     pub token_endpoint: &'a str,
@@ -120,6 +171,10 @@ pub struct RefreshContext<'a> {
     /// finds its session was signed out while it ran: the tokens it just
     /// obtained belong to no one, and are revoked rather than left live.
     pub revocation_endpoint: Option<&'a str>,
+    /// The authorization server `token_endpoint` and `revocation_endpoint` were
+    /// discovered for. A session whose issuer is any other is refused before
+    /// anything is sent ([`same_issuer`]).
+    pub issuer: &'a str,
 }
 
 /// Read a session, refreshing it first if it is close to expiry. `now` is Unix
@@ -138,6 +193,7 @@ pub async fn valid_session(
     ctx: &RefreshContext<'_>,
     now: i64,
 ) -> Result<Session> {
+    let clock = crate::Elapsing::from(now);
     let session = store
         .get(sub)
         .await?
@@ -147,6 +203,9 @@ pub async fn valid_session(
     }
 
     let _guard = locks.lock(sub).await;
+    // The wait can be long (another refresh's whole round trip): from here on
+    // the time is the time after it.
+    let now = clock.now();
 
     // Re-read AFTER acquiring the lock: whoever held it may have refreshed while
     // we waited, and presenting the token they just replaced would burn it.
@@ -184,20 +243,8 @@ async fn lost_the_row(
     now: i64,
 ) -> Result<Session> {
     let current = store.get(&obtained.sub).await?;
-    let outcome = revoke::revoke_orphaned(
-        fetcher,
-        nonces,
-        &RevokeContext {
-            revocation_endpoint: ctx.revocation_endpoint,
-            client_id: ctx.client_id,
-            auth_method: ctx.auth_method,
-            client_key: ctx.client_key,
-            deadline: revoke::ORPHAN_REVOKE_DEADLINE,
-        },
-        obtained,
-        now,
-    )
-    .await;
+    let outcome =
+        revoke::revoke_orphaned(fetcher, nonces, &orphan_context(ctx), obtained, now).await;
     if let Revocation::Failed(reason) = &outcome {
         tracing::warn!(
             sub = %obtained.sub,
@@ -221,6 +268,41 @@ async fn lost_the_row(
     )
 }
 
+/// How tokens this refresh obtained but stored nowhere are revoked: at the
+/// same authorization server, bounded like any background revocation.
+fn orphan_context<'a>(ctx: &RefreshContext<'a>) -> RevokeContext<'a> {
+    RevokeContext {
+        revocation_endpoint: ctx.revocation_endpoint,
+        client_id: ctx.client_id,
+        auth_method: ctx.auth_method,
+        client_key: ctx.client_key,
+        deadline: revoke::ORPHAN_REVOKE_DEADLINE,
+        issuer: ctx.issuer,
+    }
+}
+
+/// The tokens a 2xx refresh response carried, as a session to revoke, when the
+/// response could not be applied (it did not parse as a token response, or its
+/// `sub` is another account's). `None` when it names no token at all: a body
+/// that is not JSON, or JSON without either token, leaves nothing to revoke.
+fn unapplied_tokens(session: &Session, body: &serde_json::Value) -> Option<Session> {
+    let field = |name: &str| {
+        body.get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    };
+    let (access, refresh) = (field("access_token"), field("refresh_token"));
+    if access.is_none() && refresh.is_none() {
+        return None;
+    }
+    Some(Session {
+        access_token: access.unwrap_or_default(),
+        refresh_token: refresh.unwrap_or_default(),
+        ..session.clone()
+    })
+}
+
 /// The refresh itself. Called with the subject's lock held; `version` is the
 /// stored form of `session` as read under that lock.
 async fn refresh_locked<S: SessionStore>(
@@ -232,6 +314,9 @@ async fn refresh_locked<S: SessionStore>(
     ctx: &RefreshContext<'_>,
     now: i64,
 ) -> Result<Session> {
+    let clock = crate::Elapsing::from(now);
+    // Before anything else: this sends the REFRESH TOKEN.
+    same_issuer(ctx.issuer, &session.issuer)?;
     let key = SigningKey::from_jwk_json(&session.dpop_key_jwk, "session-dpop")?;
 
     let assertion = match ctx.auth_method {
@@ -243,7 +328,7 @@ async fn refresh_locked<S: SessionStore>(
                 client_key,
                 ctx.client_id,
                 &session.issuer,
-                now,
+                clock.now(),
             )?)
         }
         AuthMethod::None => None,
@@ -270,7 +355,7 @@ async fn refresh_locked<S: SessionStore>(
             // exchange, a rejected attempt consumes nothing.
             retry: Retry::Allowed,
         },
-        now,
+        clock.now(),
     )
     .await?;
     client_auth::log_evidence(
@@ -281,8 +366,37 @@ async fn refresh_locked<S: SessionStore>(
     );
 
     if outcome.is_success() {
-        let response = token::parse_token_response(&outcome.json()?)?;
-        let updated = apply_refresh(session, &response, now)?;
+        // A body that is not JSON names no token: nothing to revoke.
+        let body = outcome.json()?;
+        let applied = token::parse_token_response(&body)
+            .and_then(|response| apply_refresh(session, &response, clock.now()));
+        let updated = match applied {
+            Ok(updated) => updated,
+            Err(err) => {
+                // The server issued tokens we will not store (another account's
+                // `sub`, or a malformed response): revoke them rather than leave
+                // them live, under the session's key they were issued to.
+                if let Some(unapplied) = unapplied_tokens(session, &body) {
+                    let outcome = revoke::revoke_orphaned(
+                        fetcher,
+                        nonces,
+                        &orphan_context(ctx),
+                        &unapplied,
+                        clock.now(),
+                    )
+                    .await;
+                    if let Revocation::Failed(reason) = &outcome {
+                        tracing::warn!(
+                            sub = %session.sub,
+                            %reason,
+                            "a refresh response could not be applied, and its tokens \
+                             could not be revoked"
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
         // **Conditional on the row we started from — never an upsert.** The
         // lock above is in-process; a sign-out (a logout, account deletion, an
         // operator's revoke-all in another process) does not take it. An
@@ -290,7 +404,7 @@ async fn refresh_locked<S: SessionStore>(
         // session with these fresh tokens, after it had been reported signed
         // out.
         if !store.update_if_unchanged(&updated, version).await? {
-            return lost_the_row(store, fetcher, nonces, ctx, &updated, now).await;
+            return lost_the_row(store, fetcher, nonces, ctx, &updated, clock.now()).await;
         }
         // Logged because a refresh is otherwise INVISIBLE: it rotates both
         // tokens and is the one path that can silently end a session, but it
@@ -325,7 +439,13 @@ async fn refresh_locked<S: SessionStore>(
                     return Ok(current);
                 }
             }
-            store.delete(&session.sub).await?;
+            // Delete only the row we refreshed from: a re-login that landed
+            // since is a NEW grant, and deleting it would sign that user out.
+            if !store.delete_if_unchanged(&session.sub, version).await? {
+                if let Some(current) = store.get(&session.sub).await? {
+                    return Ok(current);
+                }
+            }
             bail!(
                 "refresh for {} was rejected as invalid_grant; the session has been \
                  removed and the user must log in again",
@@ -515,9 +635,21 @@ mod tests {
         String,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        token_server_replies(vec![token]).await
+    }
+
+    /// [`token_server_answering`] with successive `/token` replies (the last
+    /// repeats).
+    async fn token_server_replies(
+        token: Vec<TestResponse>,
+    ) -> (
+        Fetcher,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let (addr, log) = spawn_tls(move |_| {
             let mut r = std::collections::HashMap::new();
-            r.insert("/token".to_string(), vec![token]);
+            r.insert("/token".to_string(), token);
             r.insert("/revoke".to_string(), vec![TestResponse::json(200, "{}")]);
             r
         })
@@ -557,7 +689,55 @@ mod tests {
             auth_method: AuthMethod::None,
             client_key: None,
             revocation_endpoint: Some(revoke),
+            issuer: ISSUER,
         }
+    }
+
+    /// The issuer [`session`] belongs to.
+    const ISSUER: &str = "https://auth.example.com";
+
+    fn token_requests(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.starts_with("POST /token"))
+            .cloned()
+            .collect()
+    }
+
+    /// Decode one base64url JWT segment as JSON.
+    fn jwt_part(jwt: &str, idx: usize) -> serde_json::Value {
+        use base64::Engine as _;
+        let seg = jwt.split('.').nth(idx).expect("malformed JWT");
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(seg)
+                .expect("not base64url"),
+        )
+        .expect("not JSON")
+    }
+
+    /// The claims of one recorded request's DPoP proof.
+    fn proof_claims(raw: &str) -> serde_json::Value {
+        let proof = raw
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("dpop:"))
+            .expect("no DPoP header")[5..]
+            .trim()
+            .to_string();
+        jwt_part(&proof, 1)
+    }
+
+    /// One form parameter of one recorded request, decoded.
+    fn form_param(raw: &str, name: &str) -> Option<String> {
+        let (_, body) = raw.split_once("\r\n\r\n").expect("no body");
+        url::form_urlencoded::parse(body.as_bytes())
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    }
+
+    fn use_dpop_nonce(nonce: &str) -> TestResponse {
+        TestResponse::json(400, r#"{"error":"use_dpop_nonce"}"#).with_header("DPoP-Nonce", nonce)
     }
 
     fn revoke_requests(log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
@@ -742,9 +922,42 @@ mod tests {
                 .any(|r| r.starts_with("POST /token")),
             "the refresh never reached the token endpoint, so this proves nothing"
         );
+        // The tokens the server handed out cannot be applied, and are stored
+        // nowhere: they are revoked (best-effort, under the session's key), and
+        // the STORED grant is not.
+        let revokes = revoke_requests(&log);
+        assert!(
+            revokes.iter().any(|r| r.contains("token=other-refresh")),
+            "the unapplied tokens were left live: {revokes:#?}"
+        );
+        assert!(
+            !revokes.iter().any(|r| r.contains("old-refresh")),
+            "revoked the stored session's live token: {revokes:#?}"
+        );
+    }
+
+    /// A 2xx whose body is not a token response yields nothing to revoke: the
+    /// refresh fails, the session is untouched, and no `/revoke` is sent.
+    #[tokio::test]
+    async fn an_unparseable_refresh_response_revokes_nothing_and_keeps_the_session() {
+        let (fetcher, base, log) = token_server_answering(TestResponse::json(200, "{}")).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect_err("not a token response");
+        assert_eq!(store.get(DID).await.unwrap(), Some(session));
         assert!(
             revoke_requests(&log).is_empty(),
-            "a revocation was sent: {:#?}",
+            "{:#?}",
             revoke_requests(&log)
         );
     }
@@ -842,6 +1055,294 @@ mod tests {
             Some(theirs),
             "the live session was deleted or changed"
         );
+    }
+
+    /// A [`MemorySessions`] that stores `relogin` right after the first `get`
+    /// returns: a re-login landing between the refresh's re-read and its
+    /// delete.
+    struct ReloginAfterRead {
+        inner: MemorySessions,
+        relogin: std::sync::Mutex<Option<Session>>,
+    }
+
+    impl SessionStore for ReloginAfterRead {
+        type Version = MemoryVersion;
+
+        async fn get(&self, sub: &str) -> anyhow::Result<Option<Session>> {
+            let read = self.inner.get(sub).await?;
+            let relogin = self.relogin.lock().unwrap().take();
+            if let Some(relogin) = relogin {
+                self.inner.put(&relogin).await?;
+            }
+            Ok(read)
+        }
+        async fn get_versioned(
+            &self,
+            sub: &str,
+        ) -> anyhow::Result<Option<(Session, MemoryVersion)>> {
+            self.inner.get_versioned(sub).await
+        }
+        async fn put(&self, session: &Session) -> anyhow::Result<()> {
+            self.inner.put(session).await
+        }
+        async fn update_if_unchanged(
+            &self,
+            session: &Session,
+            version: &MemoryVersion,
+        ) -> anyhow::Result<bool> {
+            self.inner.update_if_unchanged(session, version).await
+        }
+        async fn delete(&self, sub: &str) -> anyhow::Result<bool> {
+            self.inner.delete(sub).await
+        }
+        async fn delete_if_unchanged(
+            &self,
+            sub: &str,
+            version: &MemoryVersion,
+        ) -> anyhow::Result<bool> {
+            self.inner.delete_if_unchanged(sub, version).await
+        }
+    }
+
+    /// **An `invalid_grant` deletes only the row it read.** A re-login that
+    /// lands after the refresh's re-read but before its delete is a NEW grant;
+    /// an unconditional delete signed that user out. The conditional delete
+    /// refuses, and the re-login is what the caller gets.
+    #[tokio::test]
+    async fn an_invalid_grant_does_not_delete_a_re_login_that_lands_before_the_delete() {
+        let (fetcher, base, _log) =
+            token_server_answering(TestResponse::json(400, r#"{"error":"invalid_grant"}"#)).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (memory, session, version) = stored_stale().await;
+        let relogin = Session {
+            refresh_token: "relogin-refresh".into(),
+            access_token: "relogin-access".into(),
+            expires_at: Some(NOW + 3600),
+            ..session.clone()
+        };
+        let store = ReloginAfterRead {
+            inner: memory,
+            relogin: std::sync::Mutex::new(Some(relogin.clone())),
+        };
+
+        let got = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect("the re-login is a live session");
+        assert_eq!(got, relogin);
+        assert_eq!(
+            store.inner.get(DID).await.unwrap(),
+            Some(relogin),
+            "the re-login was deleted by the old grant's invalid_grant"
+        );
+    }
+
+    // ── the request's shape, end to end ──────────────────────────────────────
+
+    /// **The refresh answers one nonce challenge, as an authorization-server
+    /// request, and proves without `ath`.** Two requests, the second carrying
+    /// the challenge's nonce; no access token rides on a token-endpoint
+    /// request (no `ath`, no `Authorization`).
+    #[tokio::test]
+    async fn a_refresh_answers_one_nonce_challenge_and_proves_without_ath() {
+        let (fetcher, base, log) =
+            token_server_replies(vec![use_dpop_nonce("as-nonce-1"), rotation()]).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+
+        let got = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW,
+        )
+        .await
+        .expect("the refresh answers the challenge");
+        assert_eq!(got.refresh_token, "rotated-refresh");
+
+        let reqs = token_requests(&log);
+        assert_eq!(reqs.len(), 2, "{reqs:#?}");
+        assert!(proof_claims(&reqs[0]).get("nonce").is_none());
+        assert_eq!(proof_claims(&reqs[1])["nonce"], "as-nonce-1");
+        for req in &reqs {
+            let claims = proof_claims(req);
+            assert!(
+                claims.get("ath").is_none(),
+                "a token-endpoint proof carried ath: {claims}"
+            );
+            assert_eq!(claims["htm"], "POST");
+            assert!(
+                !req.to_ascii_lowercase().contains("\nauthorization:"),
+                "an access token was sent to the token endpoint: {req}"
+            );
+            assert_eq!(
+                form_param(req, "refresh_token").as_deref(),
+                Some("old-refresh")
+            );
+        }
+    }
+
+    /// **A confidential client's refresh assertion is for the session's
+    /// ISSUER**, not for the token endpoint's URL (RFC 7523 §3 lets a server
+    /// accept either; atproto's servers expect the issuer).
+    #[tokio::test]
+    async fn a_private_key_jwt_refresh_asserts_for_the_sessions_issuer() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        let client_key = SigningKey::generate("client-1");
+        let client_id = "https://client.example/oauth-client-metadata.json";
+        let ctx = RefreshContext {
+            client_id,
+            auth_method: AuthMethod::PrivateKeyJwt,
+            client_key: Some(&client_key),
+            ..ctx(&token, &revoke)
+        };
+
+        refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx,
+            NOW,
+        )
+        .await
+        .expect("refresh");
+
+        let reqs = token_requests(&log);
+        let assertion = form_param(&reqs[0], "client_assertion").expect("no client_assertion");
+        crate::jwt::verify(&client_key, &assertion).expect("not signed by the client key");
+        let claims = jwt_part(&assertion, 1);
+        assert_eq!(claims["aud"], ISSUER, "{claims}");
+        assert_eq!(claims["iss"], client_id);
+        assert_eq!(claims["sub"], client_id);
+    }
+
+    /// **A refresh refuses a session whose issuer is not the one the context
+    /// was discovered for.** The token endpoint came from a discovery of
+    /// `ctx.issuer`; sending another grant's refresh token there hands it to a
+    /// different authorization server. Nothing is sent, nothing changes.
+    #[tokio::test]
+    async fn a_refresh_refuses_a_session_from_another_issuer() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        let ctx = RefreshContext {
+            issuer: "https://other-as.example.com",
+            ..ctx(&token, &revoke)
+        };
+
+        let err = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx,
+            NOW,
+        )
+        .await
+        .expect_err("another issuer's endpoint must be refused");
+        assert!(
+            format!("{err:#}").contains("different authorization server"),
+            "{err:#}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a request was sent: {:#?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(store.get(DID).await.unwrap(), Some(session));
+    }
+
+    /// **The proof's `iat` is the time it is MINTED, not the time the call
+    /// started.** A refresh that waits on the lock (another refresh holds it)
+    /// mints its proof, assertion and expiry after the wait; reusing the
+    /// entry `now` would send a proof that is already old, which a server
+    /// with a tight `iat` window rejects. Time is paused and advanced 120 s
+    /// across the wait, then resumed for the network.
+    #[tokio::test]
+    async fn a_proof_minted_after_a_lock_wait_carries_the_advanced_iat() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, _, _) = stored_stale().await;
+        let (locks, nonces) = (RefreshLocks::default(), MemoryNonces::new());
+        let ctx = ctx(&token, &revoke);
+
+        tokio::time::pause();
+        let held = locks.lock(DID).await;
+        let waiting = valid_session(&store, &fetcher, &nonces, &locks, DID, &ctx, NOW);
+        tokio::pin!(waiting);
+        assert!(
+            futures_lite_poll_pending(&mut waiting),
+            "did not wait for the lock"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        drop(held);
+        tokio::time::resume();
+
+        let got = waiting.await.expect("refresh");
+        let reqs = token_requests(&log);
+        assert_eq!(reqs.len(), 1);
+        let iat = proof_claims(&reqs[0])["iat"].as_i64().unwrap();
+        assert!(
+            (NOW + 120..NOW + 125).contains(&iat),
+            "the proof carried iat {iat}, not the time after the wait ({})",
+            NOW + 120
+        );
+        let expires_at = got.expires_at.unwrap();
+        assert!(
+            (NOW + 120 + 3600..NOW + 125 + 3600).contains(&expires_at),
+            "the expiry was computed from the entry time: {expires_at}"
+        );
+    }
+
+    /// **The refresh locks forget a subject once nothing holds or waits on
+    /// it.** One entry per subject ever refreshed, kept forever, is a slow
+    /// leak on a long-running server with many accounts.
+    #[tokio::test]
+    async fn refresh_locks_forget_a_subject_once_no_one_holds_or_waits() {
+        let locks = RefreshLocks::default();
+        let a = locks.lock(DID).await;
+        let b = locks.lock("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+        let waiter = locks.lock(DID);
+        tokio::pin!(waiter);
+        assert!(futures_lite_poll_pending(&mut waiter));
+        assert_eq!(locks.entries(), 2);
+
+        drop(a);
+        // The waiter still needs DID's entry.
+        let a_again = waiter.await;
+        assert_eq!(locks.entries(), 2);
+        drop(a_again);
+        drop(b);
+        assert_eq!(locks.entries(), 0, "a released subject's lock was kept");
+
+        // Concurrent holders of many subjects, all released.
+        let guards = futures_join_all(&locks, 50).await;
+        assert_eq!(locks.entries(), 50);
+        drop(guards);
+        assert_eq!(locks.entries(), 0);
+    }
+
+    async fn futures_join_all(locks: &RefreshLocks, n: usize) -> Vec<RefreshGuard> {
+        let mut guards = Vec::new();
+        for i in 0..n {
+            guards.push(locks.lock(&format!("did:plc:{i:024}")).await);
+        }
+        guards
     }
 
     // ── valid_session, the entry point ───────────────────────────────────────

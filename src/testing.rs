@@ -813,17 +813,22 @@ pub mod store_contract {
     const SUB: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
     const OTHER_SUB: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn session(sub: &str, refresh: &str) -> Session {
+    /// A session whose EVERY field derives from `tag`, so a store that writes
+    /// only some columns on a rewrite (only the tokens, or keeps the old key,
+    /// issuer, audience or expiry) fails the equality checks below. The tag
+    /// `"ours"` has no expiry, so a `NULL`/`None` write is exercised too.
+    fn session(sub: &str, tag: &str) -> Session {
+        let salt: i64 = tag.bytes().map(i64::from).sum::<i64>() * 7 + tag.len() as i64;
         Session {
             sub: sub.into(),
-            issuer: "https://auth.example.com".into(),
-            aud: "https://pds.example.com".into(),
-            dpop_key_jwk: r#"{"kty":"EC","d":"k"}"#.into(),
-            access_token: format!("access-for-{refresh}"),
-            refresh_token: refresh.into(),
-            token_type: "DPoP".into(),
-            granted_scope: "atproto".into(),
-            expires_at: Some(NOW + 3600),
+            issuer: format!("https://auth-{tag}.example.com"),
+            aud: format!("https://pds-{tag}.example.com"),
+            dpop_key_jwk: format!(r#"{{"kty":"EC","d":"{tag}"}}"#),
+            access_token: format!("access-for-{tag}"),
+            refresh_token: tag.into(),
+            token_type: format!("DPoP-{tag}"),
+            granted_scope: format!("atproto scope-{tag}"),
+            expires_at: (tag != "ours").then_some(NOW + 3600 + salt),
         }
     }
 
@@ -960,6 +965,32 @@ pub mod store_contract {
             "update_if_unchanged RESURRECTED a deleted session"
         );
 
+        // A version is never reused for a subject, even across a delete and a
+        // re-insert of IDENTICAL values (ABA): a store numbering writes per row
+        // from 1 would hand the re-inserted row the deleted row's version.
+        let original = session(SUB, "aba");
+        store.put(&original).await.unwrap();
+        let (_, before) = store.get_versioned(SUB).await.unwrap().unwrap();
+        assert!(store.delete(SUB).await.unwrap());
+        store.put(&original).await.unwrap();
+        assert!(
+            !store
+                .update_if_unchanged(&session(SUB, "stale-writer"), &before)
+                .await
+                .unwrap(),
+            "update_if_unchanged accepted a version from before a delete and re-insert (ABA)"
+        );
+        assert!(
+            !store.delete_if_unchanged(SUB, &before).await.unwrap(),
+            "delete_if_unchanged accepted a version from before a delete and re-insert (ABA)"
+        );
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            Some(original),
+            "a stale version changed the re-inserted row"
+        );
+        assert!(store.delete(SUB).await.unwrap());
+
         // Subjects are independent, and delete reports what it did.
         store.put(&session(SUB, "a")).await.unwrap();
         store.put(&session(OTHER_SUB, "b")).await.unwrap();
@@ -986,6 +1017,36 @@ pub mod store_contract {
         );
         assert_eq!(store.get(SUB).await.unwrap(), None);
         assert!(store.delete(OTHER_SUB).await.unwrap());
+    }
+
+    /// `take` is atomic under real parallelism: `tasks` spawned takes of one
+    /// state, released together, for `rounds` rounds; exactly one wins each
+    /// round. Needs a multi-threaded runtime (`#[tokio::test(flavor =
+    /// "multi_thread")]`), or the takes never overlap; `store` must be empty.
+    pub async fn pending_take_is_atomic<P: PendingLoginStore + 'static>(
+        store: std::sync::Arc<P>,
+        tasks: usize,
+        rounds: usize,
+    ) {
+        for round in 0..rounds {
+            let state = format!("s-atomic-{round}");
+            store.put(&pending_login(&state, NOW + 600)).await.unwrap();
+            let start = std::sync::Arc::new(tokio::sync::Barrier::new(tasks));
+            let handles: Vec<_> = (0..tasks)
+                .map(|_| {
+                    let (store, start, state) = (store.clone(), start.clone(), state.clone());
+                    tokio::spawn(async move {
+                        start.wait().await;
+                        store.take(&state, NOW).await.unwrap().is_some()
+                    })
+                })
+                .collect();
+            let mut winners = 0;
+            for handle in handles {
+                winners += usize::from(handle.await.unwrap());
+            }
+            assert_eq!(winners, 1, "round {round}: {winners} concurrent takes won");
+        }
     }
 
     /// Run every [`PendingLoginStore`] rule against `store`, which must be
