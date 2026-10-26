@@ -67,6 +67,7 @@ pub mod discovery;
 pub mod dpop;
 pub mod fetch;
 pub mod flow;
+pub mod login;
 pub mod metadata;
 pub mod net;
 pub mod request;
