@@ -40,10 +40,33 @@ pub enum Revocation {
     Revoked,
     /// There was no session to revoke — logout is idempotent.
     NoSession,
-    /// The attempt failed. The local row is gone regardless, except where
-    /// `sign_out` says it is left: a row that kept rotating, or one at another
-    /// authorization server than the endpoint's.
+    /// The attempt failed, and the local row was deleted anyway: the user is
+    /// signed out locally, and the server may still hold the grant until it
+    /// expires. (From `sign_out`, the one exception is a store whose delete
+    /// itself failed; the reason then begins "deleting the local session".)
+    /// From [`revoke_orphaned`], there was no row to begin with.
     Failed(String),
+    /// **The sign-out did NOT delete the local row**, on purpose, and the
+    /// grant it holds was not revoked. Only `sign_out` and `sign_out_with`
+    /// report it, for two cases:
+    ///
+    /// * the row on record belongs to **another authorization server** than
+    ///   the one the context was discovered for (a re-login after a PDS
+    ///   migration, read first or re-read after a change);
+    /// * the row **kept rotating** under concurrent refreshes, and its newest
+    ///   tokens were never presented.
+    ///
+    /// Deleting either would drop a live grant with no record left to revoke
+    /// it from. **The user is still signed in.** The caller must read the
+    /// row again, discover ITS issuer, and sign out again with that context
+    /// (or revoke at that issuer); reporting the user signed out without doing
+    /// so leaves them signed in.
+    ///
+    /// A separate variant rather than a flag on [`Revocation::Failed`]: a
+    /// `match` that handled only "failed" would treat a user who is still
+    /// signed in as signed out, and a new variant makes every such match
+    /// decide, at compile time.
+    LeftInPlace(String),
 }
 
 /// Which of a session's two tokens to present, and its `token_type_hint`.
@@ -121,7 +144,8 @@ pub struct RevokeContext<'a> {
     /// and the row it ends up revoking can be a different grant at another
     /// authorization server (a re-login after a PDS migration). The check ties
     /// the endpoint to the grant actually being sent there; such a row is left
-    /// for a sign-out that discovers its own issuer.
+    /// for a sign-out that discovers its own issuer, and `sign_out` reports
+    /// [`Revocation::LeftInPlace`].
     pub issuer: &'a str,
 }
 
@@ -274,7 +298,9 @@ pub(crate) async fn try_revoke_at(
 
 /// Sign a subject out: tell the authorization server, then drop the local row.
 ///
-/// **The local row goes regardless of what the server says.** The user asked to
+/// **The local row goes regardless of what the server says** (the two
+/// exceptions, below, are reported as [`Revocation::LeftInPlace`], never as
+/// `Failed`). The user asked to
 /// be logged out; a server that is down, slow, or has already forgotten the
 /// grant must not leave a usable session sitting in our store. The reference
 /// encodes the same ordering as `try { revoke } finally { delStored }`, and the
@@ -293,8 +319,9 @@ pub(crate) async fn try_revoke_at(
 /// are NOT sent here, and the row is NOT deleted. Deleting it would drop a live
 /// token unrevoked with no record left to retry from, which is the same reason
 /// a row that keeps rotating is left in place. The outcome is
-/// [`Revocation::Failed`], naming the issuer; a sign-out that discovers THAT
-/// row's issuer can finish it. A caller that discovers the endpoint per session
+/// [`Revocation::LeftInPlace`], naming the issuer: the user is still signed
+/// in, and the caller must rediscover the row's issuer and sign out again (a
+/// sign-out that discovers THAT row's issuer finishes it). A caller that discovers the endpoint per session
 /// (it is not stored on the session) uses [`sign_out_with`] and discovers
 /// inside the attempt, for the row each attempt actually read.
 #[cfg(feature = "revoke")]
@@ -317,7 +344,7 @@ pub async fn sign_out(
             crate::discovery::same_issuer(ctx.issuer, &session.issuer)
                 .err()
                 .map(|err| {
-                    Revocation::Failed(format!(
+                    Revocation::LeftInPlace(format!(
                         "{err:#}; the session was left in place for a sign-out at its own \
                          authorization server"
                     ))
@@ -336,7 +363,8 @@ pub async fn sign_out(
 /// the one that was revoked**. A row rewritten in between (a refresh rotated
 /// it) is read again and its new tokens revoked, up to three attempts; one that
 /// keeps changing is left in place, newest tokens on record, and reported as
-/// [`Revocation::Failed`]. A row that cannot be read is deleted anyway.
+/// [`Revocation::LeftInPlace`]. A row that cannot be read is deleted anyway
+/// ([`Revocation::Failed`]).
 #[cfg(feature = "revoke")]
 pub async fn sign_out_with<S, F, Fut>(
     store: &S,
@@ -353,7 +381,8 @@ where
 }
 
 /// [`sign_out_with`], with `refuse` asked about each row read before anything
-/// is sent for it: `Some(outcome)` ends the sign-out with that outcome, the
+/// is sent for it, on the FIRST read and on every re-read: `Some(outcome)`
+/// ends the sign-out with that outcome (a [`Revocation::LeftInPlace`]), the
 /// row neither revoked nor deleted.
 #[cfg(feature = "revoke")]
 async fn sign_out_checked<S, R, F, Fut>(
@@ -400,7 +429,7 @@ where
     // Still rotating. Leave the newest tokens IN PLACE — deleting them would
     // drop a live token unrevoked with no record left to retry from — and say
     // so, so a later sweep (or the user's next sign-out) can finish it.
-    Revocation::Failed(format!(
+    Revocation::LeftInPlace(format!(
         "the session kept changing while it was being signed out ({MAX_SIGN_OUT_ATTEMPTS} \
          attempts, each overtaken by a refresh); its newest tokens were left in place"
     ))
@@ -1177,7 +1206,7 @@ mod tests {
             let attempts = seen.lock().unwrap().len();
             assert_eq!(attempts, 3, "the retries were not bounded at 3");
             match &outcome {
-                Revocation::Failed(reason) => assert!(
+                Revocation::LeftInPlace(reason) => assert!(
                     reason.contains("kept changing"),
                     "failed for the wrong reason: {reason}"
                 ),
@@ -1301,13 +1330,15 @@ mod tests {
                 "the other issuer's refresh token reached the old endpoint: {revokes:#?}"
             );
             match &outcome {
-                Revocation::Failed(reason) => {
+                Revocation::LeftInPlace(reason) => {
                     assert!(
                         reason.contains("different authorization server"),
                         "{reason}"
                     )
                 }
-                other => panic!("the moved grant was not revoked, so not Revoked: {other:?}"),
+                other => {
+                    panic!("the moved grant was left in place, and must be reported so: {other:?}")
+                }
             }
             // And the re-login is LEFT, not deleted unrevoked: its grant is
             // live at its own authorization server, and a sign-out that

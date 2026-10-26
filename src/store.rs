@@ -627,6 +627,101 @@ mod tests {
         .await;
     }
 
+    /// **A parallelism step refuses a multi-thread runtime with ONE worker**:
+    /// its tasks are scheduled on that one thread and never overlap, so it
+    /// passes for any store, as on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[should_panic(expected = "at least two worker threads")]
+    async fn the_parallel_contract_steps_refuse_a_single_worker() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            std::sync::Arc::new(MemorySessions::new()),
+            2,
+            1,
+        )
+        .await;
+    }
+
+    /// The same for the parallel `take`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[should_panic(expected = "at least two worker threads")]
+    async fn the_parallel_take_refuses_a_single_worker() {
+        crate::testing::store_contract::pending_take_is_atomic(
+            std::sync::Arc::new(MemoryPendingLogins::new()),
+            2,
+            1,
+        )
+        .await;
+    }
+
+    /// A store whose conditional writes and takes fail as a serializable
+    /// transaction that lost a race does (Postgres `40001`).
+    struct SerializationFailures {
+        sessions: MemorySessions,
+        pending: MemoryPendingLogins,
+    }
+
+    const SERIALIZATION: &str = "could not serialize access due to concurrent update";
+
+    impl SessionStore for SerializationFailures {
+        type Version = <MemorySessions as SessionStore>::Version;
+        async fn get(&self, sub: &str) -> Result<Option<Session>> {
+            self.sessions.get(sub).await
+        }
+        async fn get_versioned(&self, sub: &str) -> Result<Option<(Session, Self::Version)>> {
+            self.sessions.get_versioned(sub).await
+        }
+        async fn put(&self, session: &Session) -> Result<()> {
+            self.sessions.put(session).await
+        }
+        async fn update_if_unchanged(&self, _: &Session, _: &Self::Version) -> Result<bool> {
+            anyhow::bail!(SERIALIZATION)
+        }
+        async fn delete(&self, sub: &str) -> Result<bool> {
+            self.sessions.delete(sub).await
+        }
+        async fn delete_if_unchanged(&self, _: &str, _: &Self::Version) -> Result<bool> {
+            anyhow::bail!(SERIALIZATION)
+        }
+    }
+
+    impl PendingLoginStore for SerializationFailures {
+        async fn put(&self, login: &PendingLogin) -> Result<()> {
+            self.pending.put(login).await
+        }
+        async fn take(&self, _: &str, _: i64) -> Result<Option<PendingLogin>> {
+            anyhow::bail!(SERIALIZATION)
+        }
+    }
+
+    fn serialization_failures() -> std::sync::Arc<SerializationFailures> {
+        std::sync::Arc::new(SerializationFailures {
+            sessions: MemorySessions::new(),
+            pending: MemoryPendingLogins::new(),
+        })
+    }
+
+    /// **A store that answers a lost race with an error is told so**, rather
+    /// than failing on an `unwrap` inside a spawned task: a conditional write
+    /// that loses must report `Ok(false)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "must report Ok(false), not an error")]
+    async fn a_conditional_write_that_errors_on_a_lost_race_is_named() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            serialization_failures(),
+            2,
+            1,
+        )
+        .await;
+    }
+
+    /// The same for `take`, which must report `Ok(None)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "must report Ok(None), not an error")]
+    async fn a_take_that_errors_on_a_lost_race_is_named() {
+        crate::testing::store_contract::pending_take_is_atomic(serialization_failures(), 2, 1)
+            .await;
+    }
+
     /// The contract suite against the in-memory pending-login store.
     #[tokio::test]
     async fn memory_pending_logins_meet_the_store_contract() {

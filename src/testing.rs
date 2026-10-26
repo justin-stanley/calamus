@@ -1067,8 +1067,10 @@ pub mod store_contract {
 
     /// `take` is atomic under real parallelism: `tasks` spawned takes of one
     /// state, released together, for `rounds` rounds; exactly one wins each
-    /// round. Needs a multi-threaded runtime (`#[tokio::test(flavor =
-    /// "multi_thread")]`), or the takes never overlap; `store` must be empty.
+    /// round. Needs a multi-threaded runtime with at least two workers
+    /// (`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` or more),
+    /// or the takes never overlap; `store` must be empty. A losing take must
+    /// return `Ok(None)`: an error fails the step, saying so.
     pub async fn pending_take_is_atomic<P: PendingLoginStore + 'static>(
         store: std::sync::Arc<P>,
         tasks: usize,
@@ -1084,27 +1086,64 @@ pub mod store_contract {
                     let (store, start, state) = (store.clone(), start.clone(), state.clone());
                     tokio::spawn(async move {
                         start.wait().await;
-                        store.take(&state, NOW).await.unwrap().is_some()
+                        store.take(&state, NOW).await
                     })
                 })
                 .collect();
             let mut winners = 0;
             for handle in handles {
-                winners += usize::from(handle.await.unwrap());
+                let taken = race_answer(
+                    "pending_take_is_atomic",
+                    "take",
+                    "Ok(None)",
+                    handle.await.unwrap(),
+                );
+                winners += usize::from(taken.is_some());
             }
             assert_eq!(winners, 1, "round {round}: {winners} concurrent takes won");
         }
     }
 
     /// A parallelism step on a current-thread runtime passes without testing
-    /// anything: its tasks never overlap.
+    /// anything: its tasks never overlap. Nor on a multi-thread runtime with
+    /// ONE worker (`worker_threads = 1`): the spawned tasks all run on that
+    /// thread, interleaved only at `.await`s. So the step requires at least two
+    /// workers, read from `Handle::metrics().num_workers()` (stable since
+    /// tokio 1.39; this crate pins 1.45+). The barrier each round starts its
+    /// tasks on lines them up, but cannot by itself prove they run at once: a
+    /// barrier releases cooperatively-scheduled tasks on one thread too.
     fn assert_multi_thread(step: &str) {
+        let handle = tokio::runtime::Handle::current();
         assert_eq!(
-            tokio::runtime::Handle::current().runtime_flavor(),
+            handle.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::MultiThread,
             "{step} needs a multi-thread runtime (#[tokio::test(flavor = \"multi_thread\")]); \
              on a current-thread one it passes vacuously"
         );
+        let workers = handle.metrics().num_workers();
+        assert!(
+            workers >= 2,
+            "{step} needs at least two worker threads (#[tokio::test(flavor = \
+             \"multi_thread\", worker_threads = 2)] or more), got {workers}; on one its \
+             tasks never run at once and it passes vacuously"
+        );
+    }
+
+    /// A store's answer to one racing call, or a panic that says what is
+    /// wrong when it errored: a lost race is an answer (`Ok(false)`, or
+    /// `Ok(None)` for `take`), never an error. A serializable transaction
+    /// that loses (Postgres `40001`, SQLite `SQLITE_BUSY`) must be retried
+    /// inside the store or reported as the loss it is; a caller cannot tell
+    /// an error from a broken store, and the refresh path fails the request.
+    fn race_answer<T>(step: &str, call: &str, lost: &str, answer: anyhow::Result<T>) -> T {
+        match answer {
+            Ok(answer) => answer,
+            Err(err) => panic!(
+                "{step}: {call} returned an error under contention ({err:#}). A call that \
+                 loses the race must report {lost}, not an error; if this is a \
+                 serialization failure, retry it inside the store or map it to the loss"
+            ),
+        }
     }
 
     /// The conditional writes are atomic under real parallelism: each round
@@ -1122,7 +1161,9 @@ pub mod store_contract {
     /// writes in another lets two writers both see the version they read and
     /// both report success: two refreshes each storing their own rotation, or
     /// a refresh and a sign-out both "winning", which is a resurrection. Needs
-    /// a multi-threaded runtime; `store` must be empty and is left empty.
+    /// a multi-threaded runtime with at least two workers; `store` must be
+    /// empty and is left empty. A losing write must return `Ok(false)`: an
+    /// error (a serialization failure) fails the step, saying so.
     pub async fn sessions_conditional_writes_are_atomic<S: SessionStore + 'static>(
         store: std::sync::Arc<S>,
         tasks: usize,
@@ -1151,9 +1192,9 @@ pub mod store_contract {
                             let mine = session(SUB, &format!("race-{writer}"));
                             start.wait().await;
                             let won = if update {
-                                store.update_if_unchanged(&mine, &version).await.unwrap()
+                                store.update_if_unchanged(&mine, &version).await
                             } else {
-                                store.delete_if_unchanged(SUB, &version).await.unwrap()
+                                store.delete_if_unchanged(SUB, &version).await
                             };
                             (won, update.then_some(mine))
                         })
@@ -1162,6 +1203,17 @@ pub mod store_contract {
                 let mut winners = Vec::new();
                 for handle in handles {
                     let (won, wrote) = handle.await.unwrap();
+                    let call = if wrote.is_some() {
+                        "update_if_unchanged"
+                    } else {
+                        "delete_if_unchanged"
+                    };
+                    let won = race_answer(
+                        &format!("sessions_conditional_writes_are_atomic, {label}, round {round}"),
+                        call,
+                        "Ok(false)",
+                        won,
+                    );
                     if won {
                         winners.push(wrote);
                     }

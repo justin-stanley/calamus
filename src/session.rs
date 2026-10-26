@@ -68,7 +68,9 @@ pub fn apply_refresh(session: &Session, response: &TokenResponse, now: i64) -> R
         // The GRANTED scope, which the server may have narrowed. Keeping the old
         // value would make later write failures unexplainable.
         granted_scope: response.granted_scope.clone(),
-        expires_at: response.expires_in.map(|seconds| now + seconds),
+        expires_at: response
+            .expires_in
+            .map(|seconds| now.saturating_add(seconds)),
         // Properties of the session, not of any one token response.
         sub: session.sub.clone(),
         issuer: session.issuer.clone(),
@@ -221,6 +223,12 @@ pub struct RefreshContext<'a> {
 /// authorization server has consumed the single-use refresh token; abandoning
 /// the future means the replacement is never stored and the session is dead.
 /// The reference carries the same warning for the same reason.
+///
+/// **The subject's refresh lock is held through any orphan revocation.** A
+/// refresh whose tokens cannot be stored (the row was signed out or rewritten
+/// meanwhile, or the response named another account) revokes them before
+/// returning, bounded by [`revoke::ORPHAN_REVOKE_DEADLINE`] (5 s), and other
+/// refreshes of THIS subject wait for it; other subjects are not affected.
 pub async fn valid_session(
     store: &impl SessionStore,
     fetcher: &Fetcher,
@@ -261,27 +269,49 @@ pub async fn valid_session(
 /// on record. Two cases:
 ///
 /// Either way the tokens this refresh just obtained are stored NOWHERE, and
-/// are revoked (best-effort, bounded) rather than left live at the PDS:
+/// are revoked (best-effort, bounded) rather than left live at the PDS, as
+/// far as [`orphaned_tokens`] allows:
 ///
 /// * **Rewritten** by another writer: theirs is the session on record, so it
 ///   is returned and ours is not written over it. In practice that writer is
 ///   a RE-LOGIN — a new grant. It cannot be a concurrent refresh of the same
-///   token: refresh tokens are single-use, and ours succeeded. So our tokens
-///   belong to the old grant, which nothing references any more.
+///   token at a ROTATING server: refresh tokens are single-use, and ours
+///   succeeded. So our tokens belong to the old grant, which nothing
+///   references any more. At a server that does NOT rotate, it can be another
+///   process's refresh of the same grant, which is why the refresh token we
+///   started from is never revoked here.
 /// * **Gone**: it was signed out while we refreshed. We now hold a live token
 ///   set for a session that no longer exists, and the caller gets the same
 ///   "no session" error a signed-out user gets.
+///
+/// **A benign rewrite under a rotating server** (a writer that rewrote the row
+/// without changing its tokens, such as a re-encryption or a handle update)
+/// lands here too: `current` is returned holding the refresh token this
+/// refresh has just consumed, and the rotated grant is revoked, so the user
+/// must log in again at the next refresh. Writers other than a login and a
+/// refresh must not rewrite a session row between its read and a refresh.
+///
+/// **The subject's refresh lock is still held here**, through the orphan
+/// revocation: up to [`revoke::ORPHAN_REVOKE_DEADLINE`] (5 s) against a slow
+/// authorization server, during which other refreshes of THIS subject wait.
+/// Releasing it first would let the next refresh start while the old grant is
+/// being revoked; the wait is bounded, and only this subject's.
 async fn lost_the_row(
     store: &impl SessionStore,
     fetcher: &Fetcher,
     nonces: &impl NonceStore,
     ctx: &RefreshContext<'_>,
+    from: &Session,
     obtained: &Session,
     clock: crate::Elapsing,
 ) -> Result<Session> {
     let current = store.get(&obtained.sub).await?;
-    let outcome =
-        revoke::revoke_orphaned_at(fetcher, nonces, &orphan_context(ctx), obtained, clock).await;
+    let outcome = match orphaned_tokens(from, obtained, current.as_ref()) {
+        Some(orphan) => {
+            revoke::revoke_orphaned_at(fetcher, nonces, &orphan_context(ctx), &orphan, clock).await
+        }
+        None => Revocation::NoSession,
+    };
     if let Revocation::Failed(reason) = &outcome {
         tracing::warn!(
             sub = %obtained.sub,
@@ -305,6 +335,50 @@ async fn lost_the_row(
     )
 }
 
+/// Which of the tokens a refresh `obtained` (from the session it refreshed
+/// `from`) may be revoked once the row is lost, given the row now on record
+/// (`current`). `None`: revoke nothing.
+///
+/// **Never a token equal to `from`'s refresh token or to either of
+/// `current`'s.** A server that does not rotate answers with no
+/// `refresh_token`, and [`apply_refresh`] keeps `from`'s: revoking `obtained`
+/// whole sent THAT token, ending the grant another process's row
+/// (`{their-access, old-refresh}`) still lives on.
+///
+/// **And the new access token only when its grant is on record nowhere.**
+/// Without a new refresh token, the new access token belongs to `from`'s
+/// grant, and revoking an access token may end its whole grant (RFC 7009
+/// §2.1: the server MAY revoke the refresh token too). So when `current`
+/// still holds that refresh token, nothing is revoked; when the row is gone
+/// or holds another grant, the new access token alone is.
+fn orphaned_tokens(
+    from: &Session,
+    obtained: &Session,
+    current: Option<&Session>,
+) -> Option<Session> {
+    let kept = |t: &str| {
+        t.is_empty()
+            || t == from.refresh_token
+            || t == from.access_token
+            || current.is_some_and(|c| t == c.refresh_token || t == c.access_token)
+    };
+    let refresh = (!kept(&obtained.refresh_token)).then(|| obtained.refresh_token.clone());
+    let grant_on_record = refresh.is_none()
+        && current.is_some_and(|c| {
+            !obtained.refresh_token.is_empty() && c.refresh_token == obtained.refresh_token
+        });
+    let access =
+        (!kept(&obtained.access_token) && !grant_on_record).then(|| obtained.access_token.clone());
+    if refresh.is_none() && access.is_none() {
+        return None;
+    }
+    Some(Session {
+        access_token: access.unwrap_or_default(),
+        refresh_token: refresh.unwrap_or_default(),
+        ..obtained.clone()
+    })
+}
+
 /// How tokens this refresh obtained but stored nowhere are revoked: at the
 /// same authorization server, bounded like any background revocation.
 fn orphan_context<'a>(ctx: &RefreshContext<'a>) -> RevokeContext<'a> {
@@ -319,8 +393,8 @@ fn orphan_context<'a>(ctx: &RefreshContext<'a>) -> RevokeContext<'a> {
 }
 
 /// The tokens a 2xx refresh response carried, as a session to revoke, when the
-/// response could not be applied: it did not parse as a token response
-/// (`parsed` false), or it parsed and its `sub` is another account's.
+/// response could not be applied: it did not parse as a token response, or it
+/// parsed and its `sub` is another account's.
 ///
 /// `None` (revoke nothing) when:
 ///
@@ -333,10 +407,16 @@ fn orphan_context<'a>(ctx: &RefreshContext<'a>) -> RevokeContext<'a> {
 ///   revoking an access token may end the whole grant (RFC 7009 §2.1), so
 ///   nothing is revoked at all. No token equal to either stored token is ever
 ///   sent;
-/// * **it did not parse and names no NEW refresh token.** An unparseable body
-///   is not evidence of a new grant; only a refresh token distinct from the
-///   stored one is.
-fn unapplied_tokens(session: &Session, body: &serde_json::Value, parsed: bool) -> Option<Session> {
+/// * **it names no NEW refresh token**, parsed or not. An unparseable body is
+///   not evidence of a new grant; only a refresh token distinct from the
+///   stored one is. And a response that parsed (another account's `sub`)
+///   without one did not rotate: the stored refresh token is still live, the
+///   response's access token belongs to ITS grant, and revoking that access
+///   token may end the stored grant (RFC 7009 §2.1: the server MAY revoke the
+///   refresh token along with it). It cannot be told apart from a new grant,
+///   so nothing is revoked, and the moved-`sub` access token is left to
+///   expire on its own.
+fn unapplied_tokens(session: &Session, body: &serde_json::Value) -> Option<Session> {
     let stored = |t: &str| t == session.refresh_token || t == session.access_token;
     let field = |name: &str| {
         body.get(name)
@@ -348,16 +428,11 @@ fn unapplied_tokens(session: &Session, body: &serde_json::Value, parsed: bool) -
     if refresh.as_deref().is_some_and(stored) {
         return None;
     }
-    if !parsed && refresh.is_none() {
-        return None;
-    }
+    let refresh = refresh?;
     let access = access.filter(|t| !stored(t));
-    if access.is_none() && refresh.is_none() {
-        return None;
-    }
     Some(Session {
         access_token: access.unwrap_or_default(),
-        refresh_token: refresh.unwrap_or_default(),
+        refresh_token: refresh,
         ..session.clone()
     })
 }
@@ -427,7 +502,6 @@ async fn refresh_locked<S: SessionStore>(
         // A body that is not JSON names no token: nothing to revoke.
         let body = outcome.json()?;
         let parsed = token::parse_token_response(&body);
-        let was_parsed = parsed.is_ok();
         // The expiry counts from when the proof was minted, before the request
         // went out: the server issued the token no earlier than that, so this
         // errs early (a refresh a little soon), never late (a stale token).
@@ -438,7 +512,7 @@ async fn refresh_locked<S: SessionStore>(
                 // The server issued tokens we will not store (another account's
                 // `sub`, or a malformed response): revoke them rather than leave
                 // them live, under the session's key they were issued to.
-                if let Some(unapplied) = unapplied_tokens(session, &body, was_parsed) {
+                if let Some(unapplied) = unapplied_tokens(session, &body) {
                     let outcome = revoke::revoke_orphaned_at(
                         fetcher,
                         nonces,
@@ -466,7 +540,7 @@ async fn refresh_locked<S: SessionStore>(
         // session with these fresh tokens, after it had been reported signed
         // out.
         if !store.update_if_unchanged(&updated, version).await? {
-            return lost_the_row(store, fetcher, nonces, ctx, &updated, clock).await;
+            return lost_the_row(store, fetcher, nonces, ctx, session, &updated, clock).await;
         }
         // Logged because a refresh is otherwise INVISIBLE: it rotates both
         // tokens and is the one path that can silently end a session, but it
@@ -577,6 +651,15 @@ mod tests {
             updated.access_token, "new-access",
             "the access token still rotates"
         );
+    }
+
+    /// **An absurd clock saturates rather than overflowing.** `now + secs`
+    /// panicked in a debug build (and wrapped to a past expiry in release,
+    /// refreshing on every read) for a `now` near `i64::MAX`.
+    #[test]
+    fn an_absurd_now_saturates_the_refreshed_expiry() {
+        let updated = apply_refresh(&session(), &response(), i64::MAX - 10).unwrap();
+        assert_eq!(updated.expires_at, Some(i64::MAX));
     }
 
     /// `expires_in` is optional, and absent means no proactive refresh rather
@@ -1105,14 +1188,161 @@ mod tests {
         assert_eq!(store.get(DID).await.unwrap(), Some(session));
     }
 
+    /// **A moved-`sub` response without a refresh token revokes nothing.**
+    /// The server answered the stored refresh token without rotating it, so
+    /// the stored grant is still live and the response's access token belongs
+    /// to it: revoking that access token may end the whole grant (RFC 7009
+    /// §2.1), signing the user out over a response that was refused.
+    #[tokio::test]
+    async fn a_moved_sub_without_a_refresh_token_revokes_nothing() {
+        let moved = TestResponse::json(
+            200,
+            serde_json::json!({
+                "access_token": "other-access",
+                "token_type": "DPoP",
+                "scope": "atproto",
+                "sub": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                "expires_in": 3600,
+            })
+            .to_string(),
+        );
+        let (fetcher, base, log) = token_server_answering(moved).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await
+        .expect_err("another subject is refused");
+        assert_eq!(token_requests(&log).len(), 1);
+        assert!(
+            revoke_requests(&log).is_empty(),
+            "revoked an access token of the stored grant: {:#?}",
+            revoke_requests(&log)
+        );
+        assert_eq!(store.get(DID).await.unwrap(), Some(session));
+    }
+
+    /// The `/token` reply that does NOT rotate: a new access token, no
+    /// `refresh_token`.
+    fn no_rotation() -> TestResponse {
+        TestResponse::json(
+            200,
+            serde_json::json!({
+                "access_token": "rotated-access",
+                "token_type": "DPoP",
+                "scope": "atproto",
+                "sub": DID,
+                "expires_in": 3600,
+            })
+            .to_string(),
+        )
+    }
+
+    /// **A non-rotating refresh that lost the row never revokes the stored
+    /// refresh token.** The server omits `refresh_token`, so the refreshed
+    /// session carries the one it started from; another process meanwhile
+    /// wrote `{their-access, old-refresh}`, the SAME grant. Revoking the
+    /// refreshed session sent `token=old-refresh`, ending the grant the row on
+    /// record lives on. And its new access token is that grant's too, so
+    /// nothing is sent at all.
+    #[tokio::test]
+    async fn a_non_rotating_refresh_that_lost_the_row_to_the_same_grant_revokes_nothing() {
+        let (fetcher, base, log) = token_server_answering(no_rotation()).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        let theirs = Session {
+            access_token: "their-access".into(),
+            expires_at: Some(NOW + 3600),
+            ..session.clone()
+        };
+        store.put(&theirs).await.unwrap();
+
+        let got = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await
+        .expect("the row on record is returned");
+        assert_eq!(got, theirs);
+        assert_eq!(token_requests(&log).len(), 1, "precondition: refreshed");
+        let revokes = revoke_requests(&log);
+        assert!(
+            !revokes.iter().any(|r| r.contains("old-refresh")),
+            "revoked the stored grant's own refresh token: {revokes:#?}"
+        );
+        assert!(
+            revokes.is_empty(),
+            "revoked a token of the grant on record: {revokes:#?}"
+        );
+        assert_eq!(store.get(DID).await.unwrap(), Some(theirs));
+    }
+
+    /// The same non-rotating refresh, when the row was SIGNED OUT or replaced
+    /// by another grant: the new access token is stored nowhere and its grant
+    /// is on record nowhere, so it alone is revoked. The refresh token it
+    /// started from is never sent (it is not this refresh's to end, and the
+    /// sign-out or re-login that replaced it answers for it).
+    #[tokio::test]
+    async fn a_non_rotating_refresh_that_lost_the_row_revokes_only_its_new_access_token() {
+        for relogin in [false, true] {
+            let (fetcher, base, log) = token_server_answering(no_rotation()).await;
+            let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+            let (store, session, version) = stored_stale().await;
+            if relogin {
+                store
+                    .put(&Session {
+                        access_token: "relogin-access".into(),
+                        refresh_token: "relogin-refresh".into(),
+                        expires_at: Some(NOW + 3600),
+                        ..session.clone()
+                    })
+                    .await
+                    .unwrap();
+            } else {
+                store.delete(DID).await.unwrap();
+            }
+
+            let _ = refresh_locked(
+                &store,
+                &fetcher,
+                &MemoryNonces::new(),
+                &session,
+                &version,
+                &ctx(&token, &revoke),
+                NOW.into(),
+            )
+            .await;
+            let revokes = revoke_requests(&log);
+            assert_eq!(revokes.len(), 1, "relogin={relogin}: {revokes:#?}");
+            assert_eq!(
+                form_param(&revokes[0], "token").as_deref(),
+                Some("rotated-access"),
+                "relogin={relogin}: {revokes:#?}"
+            );
+        }
+    }
+
     /// Which tokens of an unapplied 2xx are revoked, rule by rule: never one
     /// equal to a stored token, nothing when the refresh token is the stored
-    /// one, and nothing for an unparseable body without a NEW refresh token.
+    /// one, and nothing for any body without a NEW refresh token.
     #[test]
     fn unapplied_tokens_never_name_the_stored_grant() {
         let stored = session();
-        let revoked = |body: serde_json::Value, parsed: bool| {
-            unapplied_tokens(&stored, &body, parsed).map(|s| (s.access_token, s.refresh_token))
+        // `parsed` is kept in the table to show the rule does not depend on it.
+        let revoked = |body: serde_json::Value, _parsed: bool| {
+            unapplied_tokens(&stored, &body).map(|s| (s.access_token, s.refresh_token))
         };
         let pair = |a: &str, r: &str| Some((a.to_string(), r.to_string()));
 
@@ -1131,11 +1361,13 @@ mod tests {
         // token only.
         let body = serde_json::json!({"access_token": "old-access", "refresh_token": "r2"});
         assert_eq!(revoked(body, true), pair("", "r2"));
-        // No refresh token: an access token alone is revoked only from a
-        // response that parsed, and never the stored one.
+        // No refresh token: nothing, parsed or not. The server did not
+        // rotate, so the stored refresh token is still live and the new access
+        // token is ITS grant's; revoking it may end that grant (RFC 7009
+        // §2.1: the server MAY revoke the refresh token along with it).
         assert_eq!(
             revoked(serde_json::json!({"access_token": "a2"}), true),
-            pair("a2", "")
+            None
         );
         assert_eq!(
             revoked(serde_json::json!({"access_token": "a2"}), false),

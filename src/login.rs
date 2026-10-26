@@ -91,7 +91,9 @@ impl Client {
     /// they cannot disagree with the published document. Refuses a confidential
     /// client without its key (it could not sign a client assertion), and a
     /// localhost development client with one (it is public; the key would
-    /// never be used or published).
+    /// never be used or published), and a key that an inline JWKS
+    /// ([`Jwks::Inline`](crate::metadata::Jwks::Inline)) does not publish under
+    /// its `kid` (no server could verify its assertions).
     pub fn new(
         metadata: ClientMetadata,
         key: Option<SigningKey>,
@@ -107,6 +109,9 @@ impl Client {
                 bail!("the localhost development client is public and takes no signing key")
             }
             _ => {}
+        }
+        if let (Some(jwks), Some(key)) = (metadata.inline_jwks(), &key) {
+            require_published(jwks, key)?;
         }
         Ok(Self {
             client_id: metadata.client_id().to_string(),
@@ -685,7 +690,39 @@ where
 /// survives, and a server answering with a large `expires_in` widens the window
 /// in which a stolen `state` is worth replaying.
 fn pending_expiry(now: i64, par_expires_in: i64) -> i64 {
-    now + par_expires_in.min(MAX_PENDING_SECS)
+    now.saturating_add(par_expires_in.min(MAX_PENDING_SECS))
+}
+
+/// Refuse a signing key that an inline JWKS does not publish: no member with
+/// the key's RFC 7638 thumbprint under the key's `kid`.
+///
+/// The authorization server picks the verification key by the assertion's
+/// `kid` and verifies against the published one, so a key published under
+/// another `kid` (or not at all) signs assertions that every login and refresh
+/// would fail on, at the server. A `jwks_uri` is fetched by the server and is
+/// not checked here.
+fn require_published(jwks: &serde_json::Value, key: &SigningKey) -> Result<()> {
+    let thumbprint = key.thumbprint()?;
+    let published = jwks
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|member| {
+            member.get("kid").and_then(serde_json::Value::as_str) == Some(key.kid())
+                && SigningKey::public_thumbprint_of(&member.to_string())
+                    .ok()
+                    .as_deref()
+                    == Some(thumbprint.as_str())
+        });
+    if !published {
+        bail!(
+            "the inline JWKS does not publish the client signing key (kid {:?}, thumbprint \
+             {thumbprint}): authorization servers could not verify its assertions",
+            key.kid()
+        );
+    }
+    Ok(())
 }
 
 /// Read a PAR response, refusing a non-2xx before parsing it.
@@ -770,7 +807,7 @@ async fn accept_token_response(
         refresh_token: tokens.refresh_token.unwrap_or_default(),
         token_type: tokens.token_type,
         granted_scope: tokens.granted_scope,
-        expires_at: tokens.expires_in.map(|secs| now + secs),
+        expires_at: tokens.expires_in.map(|secs| now.saturating_add(secs)),
     };
     sessions.put(&session).await?;
     Ok(session)
@@ -967,6 +1004,24 @@ mod tests {
             .expect("the session must be durable before complete() returns");
         assert_eq!(stored.access_token, "at-abc");
         assert_eq!(stored.issuer, PENDING_ISSUER);
+    }
+
+    /// **An absurd clock saturates rather than overflowing**, for both the
+    /// stored session's expiry and the pending row's.
+    #[tokio::test]
+    async fn an_absurd_now_saturates_the_login_expiries() {
+        let stores = empty_stores().await;
+        let pending = pending_auth("unused-hash");
+        let session = accept_token_response(
+            &stores.sessions,
+            &pending,
+            &outcome(200, &token_body(PENDING_DID)),
+            i64::MAX - 10,
+        )
+        .await
+        .expect("accepted");
+        assert_eq!(session.expires_at, Some(i64::MAX));
+        assert_eq!(pending_expiry(i64::MAX - 10, 60), i64::MAX);
     }
 
     /// **A non-2xx token response must not be parsed as a session.**
@@ -3481,6 +3536,48 @@ mod tests {
         )
         .expect_err("a public client holding a key");
         assert!(format!("{err:#}").contains("public"), "{err:#}");
+    }
+
+    /// **An inline JWKS must publish the client's own key.** The
+    /// authorization server verifies every client assertion against the
+    /// published JWKS, by `kid`: a key that is not in it (another key, or the
+    /// right key under another `kid`) signs assertions no server can verify,
+    /// and every login and refresh fails at the server instead of here.
+    #[test]
+    fn a_client_refuses_a_key_its_inline_jwks_does_not_publish() {
+        let inline = |jwks: serde_json::Value| {
+            ClientMetadata::confidential(
+                url::Url::parse("https://app.example.com/oauth/client-metadata.json").unwrap(),
+                vec![url::Url::parse("https://app.example.com/oauth/callback").unwrap()],
+                "atproto",
+                "App",
+                None,
+                Jwks::Inline(jwks),
+            )
+            .unwrap()
+        };
+        let key = SigningKey::generate("k1");
+        let copy = || SigningKey::from_jwk_json(&key.to_jwk_json().unwrap(), "k1").unwrap();
+
+        let other = SigningKey::generate("k1").jwks_document().unwrap();
+        let err = Client::new(inline(other), Some(copy()), "https://plc.directory")
+            .expect_err("a key the inline JWKS does not publish");
+        assert!(format!("{err:#}").contains("inline JWKS"), "{err:#}");
+
+        let mut renamed = key.jwks_document().unwrap();
+        renamed["keys"][0]["kid"] = "k2".into();
+        let err = Client::new(inline(renamed), Some(copy()), "https://plc.directory")
+            .expect_err("the right key under another kid");
+        assert!(format!("{err:#}").contains("inline JWKS"), "{err:#}");
+
+        // Published (beside another key): accepted.
+        let mut both = SigningKey::generate("k0").jwks_document().unwrap();
+        both["keys"]
+            .as_array_mut()
+            .unwrap()
+            .push(key.public_jwk().unwrap());
+        Client::new(inline(both), Some(copy()), "https://plc.directory")
+            .expect("a key the inline JWKS publishes");
     }
 
     /// The client's identity comes from its metadata, so what it sends and

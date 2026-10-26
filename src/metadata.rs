@@ -232,6 +232,15 @@ impl ClientMetadata {
         }
     }
 
+    /// The JWKS document published inline (`jwks`), for a confidential client
+    /// built with [`Jwks::Inline`]. `None` for a `jwks_uri` and the dev client.
+    pub fn inline_jwks(&self) -> Option<&Value> {
+        match &self.jwks {
+            Some(PublishedJwks::Inline(document)) => Some(document),
+            _ => None,
+        }
+    }
+
     /// The client-authentication method this document publishes, and so the
     /// one every request must use.
     pub fn auth_method(&self) -> AuthMethod {

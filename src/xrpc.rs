@@ -25,6 +25,55 @@ use crate::net::Fetcher;
 use crate::request::{self, DpopBody, DpopRequest, PostOutcome, Retry};
 use crate::store::{NonceStore, Session};
 
+/// Refuse anything that is not an atproto NSID: a reversed domain authority
+/// and a name, `.`-separated, at least three segments, at most 317 characters.
+/// Authority segments are 1–63 ASCII letters, digits and hyphens, not starting
+/// or ending with a hyphen (the first not starting with a digit); the name is
+/// 1–63 ASCII letters and digits, not starting with a digit. So no `/`, `?`,
+/// `#`, `%`, whitespace, or empty segment (`..`) can reach the path.
+pub fn validate_nsid(nsid: &str) -> Result<()> {
+    let refuse = |why: &str| anyhow::anyhow!("{nsid:?} is not an NSID: {why}");
+    if nsid.len() > 317 {
+        return Err(refuse("longer than 317 characters"));
+    }
+    let segments: Vec<&str> = nsid.split('.').collect();
+    if segments.len() < 3 {
+        return Err(refuse("fewer than three segments"));
+    }
+    let (name, authority) = segments.split_last().expect("at least three");
+    for (i, segment) in authority.iter().enumerate() {
+        if segment.is_empty() || segment.len() > 63 {
+            return Err(refuse(
+                "an authority segment is empty or over 63 characters",
+            ));
+        }
+        if !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(refuse(
+                "an authority segment has a character other than a-z, 0-9, -",
+            ));
+        }
+        if segment.starts_with('-') || segment.ends_with('-') {
+            return Err(refuse("an authority segment starts or ends with a hyphen"));
+        }
+        if i == 0 && segment.starts_with(|c: char| c.is_ascii_digit()) {
+            return Err(refuse("the first segment starts with a digit"));
+        }
+    }
+    if name.is_empty() || name.len() > 63 {
+        return Err(refuse("the name is empty or over 63 characters"));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(refuse("the name has a character other than a-z, A-Z, 0-9"));
+    }
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(refuse("the name starts with a digit"));
+    }
+    Ok(())
+}
+
 /// An authenticated handle on one account's repo.
 pub struct Repo<'a, N: NonceStore> {
     /// The SSRF-guarded fetcher every request goes through.
@@ -39,8 +88,17 @@ pub struct Repo<'a, N: NonceStore> {
 
 impl<N: NonceStore> Repo<'_, N> {
     /// The XRPC endpoint for a method, on THIS session's PDS.
-    pub fn url(&self, nsid: &str) -> String {
-        format!("{}/xrpc/{nsid}", self.session.aud.trim_end_matches('/'))
+    ///
+    /// **Refuses a method that is not an NSID** ([`validate_nsid`]). It is
+    /// spliced into the path, and the request carries the access token and a
+    /// proof for whatever URL results: `../../oauth/token` reached another
+    /// endpoint of the PDS, and a `?` or `#` rewrote the query.
+    pub fn url(&self, nsid: &str) -> Result<String> {
+        validate_nsid(nsid)?;
+        Ok(format!(
+            "{}/xrpc/{nsid}",
+            self.session.aud.trim_end_matches('/')
+        ))
     }
 
     /// `GET /xrpc/{nsid}?{query}`. A non-2xx is an error whose source is an
@@ -48,8 +106,8 @@ impl<N: NonceStore> Repo<'_, N> {
     ///
     /// `now` is the time at the call (Unix seconds), for the proof's `iat`.
     pub async fn get(&self, nsid: &str, query: &[(&str, &str)], now: i64) -> Result<PostOutcome> {
-        let mut url =
-            url::Url::parse(&self.url(nsid)).with_context(|| format!("building the {nsid} URL"))?;
+        let mut url = url::Url::parse(&self.url(nsid)?)
+            .with_context(|| format!("building the {nsid} URL"))?;
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
@@ -63,7 +121,7 @@ impl<N: NonceStore> Repo<'_, N> {
     /// `now` is the time at the call (Unix seconds), for the proof's `iat`.
     pub async fn post_json(&self, nsid: &str, body: &Value, now: i64) -> Result<PostOutcome> {
         let bytes = serde_json::to_vec(body)?;
-        self.send(&self.url(nsid), DpopBody::Json(bytes), nsid, now)
+        self.send(&self.url(nsid)?, DpopBody::Json(bytes), nsid, now)
             .await
     }
 
@@ -315,10 +373,75 @@ mod tests {
         s.aud = "https://pds.example.com/".into();
         let repo = repo(&fetcher, &nonces, &s, &key);
         assert_eq!(
-            repo.url("com.atproto.repo.listRecords"),
+            repo.url("com.atproto.repo.listRecords").unwrap(),
             "https://pds.example.com/xrpc/com.atproto.repo.listRecords",
             "a trailing slash on the audience must not double the separator"
         );
+    }
+
+    /// **A method that is not an NSID is refused before anything is sent.**
+    /// The method is spliced into the path: `../../oauth/token` (normalised
+    /// by the URL parser) reached another endpoint on the PDS with the access
+    /// token and a proof for it, and `?` or `#` rewrote the query. Every
+    /// shape is refused, by `get` and `post_json` alike, and nothing reaches
+    /// the server; a real method still goes through.
+    #[tokio::test]
+    async fn a_method_that_is_not_an_nsid_is_refused_before_sending() {
+        let (fetcher, origin, log) = pds(vec![(
+            "/xrpc/com.atproto.repo.listRecords",
+            vec![TestResponse::json(200, "{}")],
+        )])
+        .await;
+        let nonces = MemoryNonces::new();
+        let key = SigningKey::generate("k");
+        let mut s = session();
+        s.aud = origin;
+        let repo = repo(&fetcher, &nonces, &s, &key);
+
+        for bad in [
+            "",
+            "com.atproto",
+            "../../oauth/token",
+            "com.atproto.repo/../../oauth/token",
+            "com..atproto.repo",
+            "com.atproto.repo.listRecords?repo=x",
+            "com.atproto.repo.listRecords#x",
+            "com.atproto.repo.list Records",
+            "com.atproto.repo.list%2FRecords",
+            "com.atproto.repo.",
+            ".com.atproto.repo",
+            "-com.atproto.repo",
+            "com.atproto-.repo",
+            "com.atproto.repo.list-records",
+            "com.atproto.repo.9list",
+            "1com.atproto.repo",
+        ] {
+            let err = repo
+                .get(bad, &[], NOW)
+                .await
+                .expect_err(&format!("{bad:?} was accepted by get"));
+            assert!(
+                format!("{err:#}").contains("not an NSID"),
+                "{bad:?}: {err:#}"
+            );
+            let err = repo
+                .post_json(bad, &json!({}), NOW)
+                .await
+                .expect_err(&format!("{bad:?} was accepted by post_json"));
+            assert!(
+                format!("{err:#}").contains("not an NSID"),
+                "{bad:?}: {err:#}"
+            );
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a request was sent: {:#?}",
+            log.lock().unwrap()
+        );
+
+        repo.get("com.atproto.repo.listRecords", &[], NOW)
+            .await
+            .expect("a real method is sent");
     }
 
     /// An XRPC error document is summarised by its `error`/`message` fields
