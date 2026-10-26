@@ -77,3 +77,5 @@ pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
+#[cfg(feature = "xrpc")]
+pub mod xrpc;
