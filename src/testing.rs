@@ -718,3 +718,67 @@ pub async fn serve_redirect_to_final() -> SocketAddr {
     });
     addr
 }
+
+/// A [`DnsResolver`](crate::resolve::DnsResolver) that answers from a fixed
+/// table and records every name it was asked for. No network.
+///
+/// A name not in the table has no records (`Ok(None)`). Names are matched
+/// exactly, and must be registered fully qualified (with the trailing dot), the
+/// form resolution queries; so a query that lost its dot finds nothing and shows
+/// up in [`StaticDns::queries`] as the bare name it was.
+#[derive(Debug, Default)]
+pub struct StaticDns {
+    answers: HashMap<String, std::result::Result<crate::resolve::TxtRecords, String>>,
+    queries: Mutex<Vec<String>>,
+}
+
+impl StaticDns {
+    /// A resolver with no records anywhere.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer `fqdn` with `records`: one entry per TXT record, each the record's
+    /// character-strings in order. Panics unless `fqdn` ends in `.`.
+    pub fn with_txt(mut self, fqdn: &str, records: &[&[&str]]) -> Self {
+        assert!(fqdn.ends_with('.'), "register {fqdn:?} fully qualified");
+        let records = records
+            .iter()
+            .map(|chunks| chunks.iter().map(|c| c.as_bytes().to_vec()).collect())
+            .collect();
+        self.answers.insert(fqdn.to_string(), Ok(records));
+        self
+    }
+
+    /// Fail every lookup of `fqdn` with `message` — a SERVFAIL, a timeout, a
+    /// name that cannot be constructed: anything that is not "no records".
+    /// Panics unless `fqdn` ends in `.`.
+    pub fn failing(mut self, fqdn: &str, message: &str) -> Self {
+        assert!(fqdn.ends_with('.'), "register {fqdn:?} fully qualified");
+        self.answers
+            .insert(fqdn.to_string(), Err(message.to_string()));
+        self
+    }
+
+    /// Every name looked up so far, in order.
+    pub fn queries(&self) -> Vec<String> {
+        self.queries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+impl crate::resolve::DnsResolver for StaticDns {
+    async fn txt(&self, fqdn: &str) -> Result<Option<crate::resolve::TxtRecords>> {
+        self.queries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(fqdn.to_string());
+        match self.answers.get(fqdn) {
+            None => Ok(None),
+            Some(Ok(records)) => Ok(Some(records.clone())),
+            Some(Err(message)) => Err(anyhow::anyhow!("{message}")),
+        }
+    }
+}

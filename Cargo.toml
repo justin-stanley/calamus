@@ -14,6 +14,14 @@ repository = "https://git.justin-stanley.com/justin/calamus"
 anyhow = "1"
 base64 = "0.23"
 getrandom = "0.4"
+# Handle -> DID by `_atproto.<handle>` TXT record, which the handle spec makes the
+# PREFERRED method (a real handle resolves by TXT alone; its well-known 404s), so
+# `tokio::net::lookup_host` (A/AAAA only) is not enough. Behind the default-on
+# `dns` feature: `resolve::SystemResolver` is its only user, and a caller with its
+# own resolver implements `resolve::DnsResolver` instead. FeatherReader's exact
+# spec; default-features are already the minimum, and the host's own resolver
+# configuration is the correct behaviour for handle resolution.
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"], optional = true }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
 # The SSRF-guarded fetcher (`net`). FeatherReader's exact spec: rustls rather than
 # native-tls, gzip because FeatherReader's feed fetch shares the fetcher, json for
@@ -43,6 +51,10 @@ tokio = { version = "1.45", features = ["io-util", "macros", "net", "process", "
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [features]
+default = ["dns"]
+# `resolve::SystemResolver`: DNS TXT lookups through hickory with the host's own
+# resolver configuration.
+dns = ["dep:hickory-resolver"]
 # Test helpers for crates that depend on calamus: `client_auth::record_evidence`
 # and `calamus::testing` (the test CA, TLS and HTTP test servers, and per-Fetcher
 # host overrides, which deliberately bypass the SSRF guard for named hosts).

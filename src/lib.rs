@@ -32,8 +32,11 @@ pub fn error_body_worth_parsing(body: &[u8]) -> bool {
     !body.is_empty() && body.len() <= MAX_ERROR_BODY
 }
 pub mod client_auth;
+pub mod discovery;
+pub mod fetch;
 pub mod flow;
 pub mod metadata;
 pub mod net;
+pub mod resolve;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
