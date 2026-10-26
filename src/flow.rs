@@ -27,6 +27,7 @@ use ring::digest::{digest, SHA256};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
 
+use crate::error::CallbackError;
 use crate::store::{PendingLogin, PendingLoginStore};
 
 /// 32 CSPRNG bytes as unpadded base64url is 43 characters — the minimum RFC 7636
@@ -275,13 +276,13 @@ impl std::fmt::Debug for CallbackParams {
 /// [`complete_callback`] does all three.
 pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result<String> {
     if params.response.is_some() {
-        bail!("authorization response uses JARM, which is not supported");
+        return Err(callback(CallbackError::Jarm));
     }
     // A `state` is needed to find the flow at all, so its absence is a rejection
     // rather than something to report against a flow we cannot identify.
     let state = params.state.as_deref().unwrap_or_default();
     if state.is_empty() {
-        bail!("authorization response carries no `state`");
+        return Err(callback(CallbackError::NoState));
     }
     // `iss` is validated BEFORE any error is reported. RFC 9207 §2.4: "For error
     // responses, clients MUST NOT assume that the error originates from the
@@ -290,9 +291,12 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
     let iss = params
         .iss
         .as_deref()
-        .context("authorization response carries no `iss` (RFC 9207); refusing it")?;
+        .ok_or_else(|| callback(CallbackError::NoIssuerParameter))?;
     if iss != expected_issuer {
-        bail!("authorization response `iss` is {iss:?}, expected {expected_issuer:?}");
+        return Err(callback(CallbackError::IssuerParameterMismatch {
+            got: iss.to_string(),
+            expected: expected_issuer.to_string(),
+        }));
     }
     // Evidence that the check ran on a live response, not just in tests (#262).
     // The issuer is public metadata; nothing secret is in this line.
@@ -304,17 +308,21 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
     // text, and whatever the caller does with an error message should not
     // inherit an injection surface from them.
     if let Some(error) = params.error.as_deref() {
-        bail!(
-            "authorization server returned error {:?}",
-            known_error_slug(error)
-        );
+        return Err(callback(CallbackError::ServerError(known_error_slug(
+            error,
+        ))));
     }
 
     let code = params.code.as_deref().unwrap_or_default();
     if code.is_empty() {
-        bail!("authorization response carries no `code`");
+        return Err(callback(CallbackError::NoCode));
     }
     Ok(code.to_string())
+}
+
+/// A refused callback, as the `anyhow::Error` every function here returns.
+fn callback(err: CallbackError) -> anyhow::Error {
+    crate::Error::from(err).into()
 }
 
 /// Consume the pending login, check the browser binding, and validate the
@@ -337,23 +345,20 @@ pub async fn complete_callback(
     now: i64,
 ) -> Result<(PendingLogin, String)> {
     if params.response.is_some() {
-        bail!("authorization response uses JARM, which is not supported");
+        return Err(callback(CallbackError::Jarm));
     }
     let state = params.state.as_deref().unwrap_or_default();
     if state.is_empty() {
-        bail!("authorization response carries no `state`");
+        return Err(callback(CallbackError::NoState));
     }
 
     let pending = store
         .take(state, now)
         .await?
-        .context("no pending login for that `state` (unknown, expired, or already used)")?;
+        .ok_or_else(|| callback(CallbackError::NoPendingLogin))?;
 
     if !binding_matches(&pending.browser_binding_hash, presented_cookie) {
-        bail!(
-            "the callback did not present the browser-binding cookie for this login; \
-             refusing to complete a flow this browser did not start"
-        );
+        return Err(callback(CallbackError::BindingMismatch));
     }
 
     let code = verify_callback(params, &pending.issuer)?;

@@ -24,6 +24,7 @@ use anyhow::Result;
 
 use crate::client_auth::{self, AuthMethod};
 use crate::dpop::Endpoint;
+use crate::error::RevokeError;
 use crate::keys::SigningKey;
 use crate::net::Fetcher;
 use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
@@ -240,16 +241,16 @@ pub(crate) async fn try_revoke_at(
 ) -> Result<()> {
     // Before anything else: this sends the REFRESH TOKEN.
     crate::discovery::same_issuer(ctx.issuer, &session.issuer)?;
-    let endpoint = ctx.revocation_endpoint.ok_or_else(|| {
-        anyhow::anyhow!("the authorization server advertises no revocation endpoint")
-    })?;
+    let endpoint = ctx
+        .revocation_endpoint
+        .ok_or(crate::Error::Revoke(RevokeError::NoEndpoint))?;
 
     let (token, _hint) = token_to_revoke(session);
     let assertion = match ctx.auth_method {
         AuthMethod::PrivateKeyJwt => {
-            let key = ctx.client_key.ok_or_else(|| {
-                anyhow::anyhow!("private_key_jwt requires the client signing key")
-            })?;
+            let key = ctx
+                .client_key
+                .ok_or(crate::Error::Revoke(RevokeError::NoClientKey))?;
             Some(client_auth::client_assertion(
                 key,
                 ctx.client_id,
@@ -291,7 +292,10 @@ pub(crate) async fn try_revoke_at(
     // RFC 7009 §2.2: a 200 also means "we did not recognise that token", which
     // is success for our purposes — the grant is not usable either way.
     if !(200..300).contains(&outcome.status) {
-        anyhow::bail!("the revocation endpoint returned status {}", outcome.status);
+        return Err(crate::Error::Revoke(RevokeError::Status {
+            status: outcome.status,
+        })
+        .into());
     }
     Ok(())
 }

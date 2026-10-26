@@ -100,3 +100,9 @@ required-features = ["test-util", "xrpc"]
 [[test]]
 name = "e2e_proof_replay"
 required-features = ["test-util"]
+
+# The messages callers match on, pinned, and the typed `calamus::Error` behind
+# each decision. Every path it drives: login, refresh, sign-out and XRPC.
+[[test]]
+name = "e2e_errors"
+required-features = ["test-util", "revoke", "xrpc"]

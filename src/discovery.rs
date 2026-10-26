@@ -23,6 +23,7 @@
 use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 
+use crate::error::DiscoveryError;
 use crate::net::Fetcher;
 
 /// The only DPoP signing algorithm this client has.
@@ -138,10 +139,11 @@ where
 /// this branch, on the path that carries the REFRESH TOKEN — passed every test.
 pub fn same_issuer(discovered: &str, expected: &str) -> Result<()> {
     if discovered != expected {
-        anyhow::bail!(
-            "the PDS now names a different authorization server ({discovered:?}) than this \
-             grant was issued by ({expected:?}); refusing to send credentials to it"
-        );
+        return Err(crate::Error::from(DiscoveryError::IssuerMismatch {
+            discovered: discovered.to_string(),
+            expected: expected.to_string(),
+        })
+        .into());
     }
     Ok(())
 }
@@ -356,10 +358,13 @@ fn require_endpoint(metadata: &Value, field: &str, issuer: &str) -> Result<Strin
     // remove the redirect.
     let origin = origin_of(raw)?;
     if origin != issuer {
-        bail!(
-            "`{field}` {raw:?} is on {origin:?}, not the issuer's own origin {issuer:?}; \
-             refusing to treat it as part of this authorization server"
-        );
+        return Err(crate::Error::from(DiscoveryError::EndpointOffOrigin {
+            field: field.to_string(),
+            url: raw.to_string(),
+            origin,
+            issuer: issuer.to_string(),
+        })
+        .into());
     }
     Ok(raw.to_string())
 }
@@ -395,7 +400,11 @@ pub fn validate_authorization_server(
         .and_then(Value::as_str)
         .context("authorization-server metadata has no `issuer`")?;
     if declared != issuer {
-        bail!("authorization-server declares issuer {declared:?} but was fetched from {issuer:?}");
+        return Err(crate::Error::from(DiscoveryError::MetadataIssuerMismatch {
+            declared: declared.to_string(),
+            fetched: issuer.to_string(),
+        })
+        .into());
     }
 
     // And the other direction: a PDS cannot unilaterally name an authorization
@@ -411,7 +420,7 @@ pub fn validate_authorization_server(
             .filter_map(Value::as_str)
             .any(|r| r == pds_origin)
         {
-            bail!("PDS {pds_origin:?} is not listed in the authorization server's protected_resources");
+            return Err(crate::Error::from(DiscoveryError::PdsNotProtected { pds_origin }).into());
         }
     }
 

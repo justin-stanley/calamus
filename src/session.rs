@@ -22,11 +22,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::client_auth::{self, AuthMethod};
 use crate::dpop::Endpoint;
+use crate::error::{Grant, SessionGone, TokenError};
 use crate::keys::SigningKey;
 use crate::net::Fetcher;
 use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
@@ -48,11 +49,12 @@ pub use crate::discovery::same_issuer;
 pub fn apply_refresh(session: &Session, response: &TokenResponse, now: i64) -> Result<Session> {
     // A refresh must never be able to move a session to another account.
     if response.sub != session.sub {
-        bail!(
-            "refresh returned subject {:?}, expected {:?}; refusing to rebind the session",
-            response.sub,
-            session.sub
-        );
+        return Err(crate::Error::from(TokenError::SubjectMismatch {
+            expected: session.sub.clone(),
+            returned: response.sub.clone(),
+            during: Grant::Refresh,
+        })
+        .into());
     }
 
     Ok(Session {
@@ -242,7 +244,7 @@ pub async fn valid_session(
     let session = store
         .get(sub)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("no session for {sub}"))?;
+        .ok_or_else(|| no_session(sub, SessionGone::Absent))?;
     if !token::is_stale(session.expires_at, now) {
         return Ok(session);
     }
@@ -257,7 +259,7 @@ pub async fn valid_session(
     let (session, version) = store
         .get_versioned(sub)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("session for {sub} disappeared while waiting to refresh"))?;
+        .ok_or_else(|| no_session(sub, SessionGone::WhileWaitingToRefresh))?;
     if !token::is_stale(session.expires_at, now) {
         return Ok(session);
     }
@@ -323,16 +325,21 @@ async fn lost_the_row(
     if let Some(current) = current {
         return Ok(current);
     }
-    bail!(
-        "no session for {}: it was signed out while being refreshed (the new tokens were \
-         not stored{})",
-        obtained.sub,
-        if outcome == Revocation::Revoked {
-            ", and were revoked"
-        } else {
-            ""
-        }
-    )
+    Err(no_session(
+        &obtained.sub,
+        SessionGone::SignedOutWhileRefreshing {
+            revoked: outcome == Revocation::Revoked,
+        },
+    ))
+}
+
+/// An [`crate::Error::NoSession`], as the `anyhow::Error` returned here.
+fn no_session(sub: &str, gone: SessionGone) -> anyhow::Error {
+    crate::Error::NoSession {
+        sub: sub.to_string(),
+        gone,
+    }
+    .into()
 }
 
 /// Which of the tokens a refresh `obtained` (from the session it refreshed
@@ -559,11 +566,12 @@ async fn refresh_locked<S: SessionStore>(
             // Network, 5xx, anything unrecognised: leave the stored tokens
             // exactly as they are and fail THIS request. Deleting here would log
             // someone out for a server hiccup.
-            bail!(
-                "refresh for {} failed transiently (status {}); the session is left intact",
-                session.sub,
-                outcome.status
-            )
+            Err(crate::Error::Refresh {
+                failure: RefreshFailure::Transient,
+                sub: session.sub.clone(),
+                status: outcome.status,
+            }
+            .into())
         }
         RefreshFailure::SessionInvalid => {
             // Before concluding the grant is dead, check whether another PROCESS
@@ -582,11 +590,12 @@ async fn refresh_locked<S: SessionStore>(
                     return Ok(current);
                 }
             }
-            bail!(
-                "refresh for {} was rejected as invalid_grant; the session has been \
-                 removed and the user must log in again",
-                session.sub
-            )
+            Err(crate::Error::Refresh {
+                failure: RefreshFailure::SessionInvalid,
+                sub: session.sub.clone(),
+                status: outcome.status,
+            }
+            .into())
         }
     }
 }

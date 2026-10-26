@@ -30,6 +30,7 @@ use anyhow::{bail, Context as _, Result};
 use crate::client_auth::{self, AuthMethod};
 use crate::discovery::{self, AuthorizationServer};
 use crate::dpop;
+use crate::error::{Grant, TokenError};
 use crate::flow::{self, CallbackParams};
 use crate::keys::SigningKey;
 use crate::metadata::ClientMetadata;
@@ -733,10 +734,10 @@ fn require_published(jwks: &serde_json::Value, key: &SigningKey) -> Result<()> {
 /// the user to a grant the server never issued.
 fn accept_par_response(outcome: &PostOutcome) -> Result<flow::ParResponse> {
     if !outcome.is_success() {
-        bail!(
-            "the pushed authorization request failed with status {}",
-            outcome.status
-        );
+        return Err(crate::Error::from(TokenError::ParFailed {
+            status: outcome.status,
+        })
+        .into());
     }
     flow::parse_par_response(&outcome.json()?)
 }
@@ -784,7 +785,10 @@ async fn accept_token_response(
     now: i64,
 ) -> Result<Session> {
     if !outcome.is_success() {
-        bail!("the token exchange failed with status {}", outcome.status);
+        return Err(crate::Error::from(TokenError::ExchangeFailed {
+            status: outcome.status,
+        })
+        .into());
     }
     let tokens = token::parse_token_response(&outcome.json()?)?;
 
@@ -792,10 +796,12 @@ async fn accept_token_response(
     // returns a different one has authorized a different account than the user
     // asked for, and everything downstream is keyed on `sub`.
     if tokens.sub != pending.did {
-        bail!(
-            "the authorization server returned tokens for a different subject than the \
-             login was started for"
-        );
+        return Err(crate::Error::from(TokenError::SubjectMismatch {
+            expected: pending.did.clone(),
+            returned: tokens.sub,
+            during: Grant::Authorization,
+        })
+        .into());
     }
 
     let session = Session {

@@ -2,10 +2,13 @@
 //!
 //! See `design/EXTRACTION-PLAN.md` for what each module is and the order they arrive in.
 
+pub mod error;
 pub mod identity;
 pub mod jwt;
 pub mod keys;
 pub mod token;
+
+pub use error::Error;
 
 /// Largest error body any path here will parse looking for one field.
 ///

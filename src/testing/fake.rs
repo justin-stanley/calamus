@@ -418,6 +418,13 @@ impl Fake {
         self.st().fail_next = Some(status);
     }
 
+    /// Answer the next authenticated `/xrpc/*` request (one whose token and
+    /// proof pass every check) with `status` and `body`: a PDS rejecting a
+    /// well-formed call, such as an `applyWrites` it failed on.
+    pub fn fail_next_xrpc_with(&self, status: u16, body: Value) {
+        self.st().fail_next_xrpc = Some((status, body));
+    }
+
     /// Hold the answer to the next request to `/par`, `/token` or `/revoke`
     /// for `delay` (a slow or hanging server). The request is still handled.
     pub fn stall_next(&self, delay: Duration) {
@@ -634,6 +641,7 @@ struct State {
     advertise_revocation: bool,
     nonce_generation: u32,
     fail_next: Option<u16>,
+    fail_next_xrpc: Option<(u16, Value)>,
     stall_next: Option<Duration>,
     // memory
     seen: Vec<Seen>,
@@ -667,6 +675,7 @@ impl State {
             advertise_revocation: true,
             nonce_generation: 0,
             fail_next: None,
+            fail_next_xrpc: None,
             stall_next: None,
             seen: Vec::new(),
             jtis: HashSet::new(),
@@ -795,7 +804,14 @@ impl State {
     /// the key it was issued to. Answers `{"did": <sub>}`.
     fn xrpc(&mut self, req: &Request) -> Reply {
         let reply = match self.xrpc_checked(req) {
-            Ok(body) => json_reply(200, &body),
+            Ok(body) => match self.fail_next_xrpc.take() {
+                Some((status, failure)) => {
+                    let mut reply = json_reply(status, &failure);
+                    reply.refusal = Some("injected by fail_next_xrpc_with".into());
+                    reply
+                }
+                None => json_reply(200, &body),
+            },
             Err(refusal) => refusal_reply(Role::ResourceServer, refusal),
         };
         self.offer_nonce(Role::ResourceServer, reply)

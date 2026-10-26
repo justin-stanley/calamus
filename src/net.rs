@@ -466,7 +466,11 @@ fn first_vetted(name: &str, addrs: impl Iterator<Item = SocketAddr>) -> Result<S
     for sa in addrs {
         let ip = sa.ip();
         if is_forbidden_ip(&ip) {
-            bail!("refusing to fetch {name:?}: resolves to forbidden address {ip}");
+            return Err(crate::Error::Ssrf {
+                host: name.to_string(),
+                ip,
+            }
+            .into());
         }
         // Keep the FIRST vetted answer as the address to pin the connect to.
         // Every answer is still checked (the loop continues), so a mixed A/AAAA
@@ -561,13 +565,21 @@ impl Fetcher {
         match host {
             Host::Ipv4(ip) => {
                 if is_forbidden_ip(&IpAddr::V4(ip)) {
-                    bail!("refusing to fetch forbidden (internal) address {ip}");
+                    return Err(crate::Error::Ssrf {
+                        host: ip.to_string(),
+                        ip: IpAddr::V4(ip),
+                    }
+                    .into());
                 }
                 Ok(SocketAddr::new(IpAddr::V4(ip), port))
             }
             Host::Ipv6(ip) => {
                 if is_forbidden_ip(&IpAddr::V6(ip)) {
-                    bail!("refusing to fetch forbidden (internal) address {ip}");
+                    return Err(crate::Error::Ssrf {
+                        host: ip.to_string(),
+                        ip: IpAddr::V6(ip),
+                    }
+                    .into());
                 }
                 Ok(SocketAddr::new(IpAddr::V6(ip), port))
             }
@@ -744,11 +756,12 @@ impl Fetcher {
             if resp.status() != reqwest::StatusCode::NOT_MODIFIED && resp.status().is_redirection()
             {
                 if max_redirects == 0 {
-                    bail!(
-                        "refusing to follow a {} redirect while fetching {url:?} \u{2014} \
-                         this document's origin is load-bearing and must not be moved",
-                        resp.status()
-                    );
+                    return Err(crate::Error::RedirectRefused {
+                        status: resp.status().as_u16(),
+                        url: url.to_string(),
+                        refusal: crate::error::RedirectRefusal::NotFollowed,
+                    }
+                    .into());
                 }
                 // Of the relocating statuses, only these five name a single
                 // target worth following. `300 Multiple Choices` names no one
@@ -761,11 +774,12 @@ impl Fetcher {
                 // feed autodiscovery, so a `305` whose error page carries a
                 // `<link rel="alternate">` would become a subscription.
                 if !matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-                    bail!(
-                        "refusing to act on a {} response while fetching {url:?} \u{2014} \
-                         it names no single target that can be followed safely",
-                        resp.status()
-                    );
+                    return Err(crate::Error::RedirectRefused {
+                        status: resp.status().as_u16(),
+                        url: url.to_string(),
+                        refusal: crate::error::RedirectRefusal::NoSingleTarget,
+                    }
+                    .into());
                 }
                 let location = resp
                     .headers()
@@ -890,11 +904,14 @@ impl Fetcher {
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("<none>");
-            bail!(
-                "refusing to follow a {} redirect on a POST to {url:?} (Location: {location}) — \
-                 a 307/308 would re-send the request body to the new host",
-                resp.status()
-            );
+            return Err(crate::Error::RedirectRefused {
+                status: resp.status().as_u16(),
+                url: url.to_string(),
+                refusal: crate::error::RedirectRefusal::OnPost {
+                    location: location.to_string(),
+                },
+            }
+            .into());
         }
 
         Ok(resp)

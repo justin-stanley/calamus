@@ -15,6 +15,8 @@
 //! Ported from FeatherReader `src/oauth/identity.rs`.
 
 use anyhow::{bail, Context as _, Result};
+
+use crate::error::{HandleProblem, ResolutionError};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -48,24 +50,24 @@ pub const AT_URI_PREFIX: &str = "at://";
 pub fn normalize_handle(input: &str) -> Result<String> {
     let handle = input.trim().to_ascii_lowercase();
     if handle.is_empty() || handle.len() > 253 {
-        bail!("handle {input:?} has an invalid length");
+        return Err(invalid_handle(input, HandleProblem::InvalidLength));
     }
     let labels: Vec<&str> = handle.split('.').collect();
     if labels.len() < 2 {
-        bail!("handle {input:?} must have at least two segments");
+        return Err(invalid_handle(input, HandleProblem::TooFewSegments));
     }
     for label in &labels {
         if label.is_empty() || label.len() > 63 {
-            bail!("handle {input:?} has an empty or over-long segment");
+            return Err(invalid_handle(input, HandleProblem::SegmentLength));
         }
         if !label
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
-            bail!("handle {input:?} has a segment with illegal characters");
+            return Err(invalid_handle(input, HandleProblem::IllegalCharacters));
         }
         if label.starts_with('-') || label.ends_with('-') {
-            bail!("handle {input:?} has a segment starting or ending with a hyphen");
+            return Err(invalid_handle(input, HandleProblem::EdgeHyphen));
         }
     }
     // Spec: "The last segment (the 'top level domain') can not start with a
@@ -73,12 +75,24 @@ pub fn normalize_handle(input: &str) -> Result<String> {
     // and `alice.4chan` through.
     let tld = labels[labels.len() - 1];
     if tld.starts_with(|c: char| c.is_ascii_digit()) {
-        bail!("handle {input:?} has a TLD starting with a digit");
+        return Err(invalid_handle(input, HandleProblem::NumericTld));
     }
     if RESERVED_TLDS.contains(&tld) {
-        bail!("handle {input:?} uses the reserved TLD .{tld}");
+        return Err(invalid_handle(
+            input,
+            HandleProblem::ReservedTld(tld.to_string()),
+        ));
     }
     Ok(handle)
+}
+
+/// A [`ResolutionError::InvalidHandle`] for `input` as given.
+fn invalid_handle(input: &str, problem: HandleProblem) -> anyhow::Error {
+    crate::Error::from(ResolutionError::InvalidHandle {
+        handle: input.to_string(),
+        problem,
+    })
+    .into()
 }
 
 /// Whether a `did:web` method-specific id is a bare, canonical hostname.
@@ -260,7 +274,10 @@ pub fn did_document_url(did: &str, plc_directory: &str) -> Result<String> {
         }
         return Ok(format!("https://{host}/.well-known/did.json"));
     }
-    bail!("unsupported DID method in {did:?}; only did:plc and did:web are resolvable")
+    Err(crate::Error::from(ResolutionError::UnsupportedDidMethod {
+        did: did.to_string(),
+    })
+    .into())
 }
 
 /// Validate a DID document against the DID that was requested.
@@ -274,7 +291,11 @@ pub fn validate_did_document(document: &Value, expected_did: &str) -> Result<()>
         .and_then(Value::as_str)
         .context("DID document has no `id`")?;
     if id != expected_did {
-        bail!("DID document id {id:?} does not match the requested DID {expected_did:?}");
+        return Err(crate::Error::from(ResolutionError::DidDocumentMismatch {
+            id: id.to_string(),
+            expected: expected_did.to_string(),
+        })
+        .into());
     }
 
     // Duplicate service ids make "the first #atproto_pds" depend on array order.
@@ -355,7 +376,10 @@ pub fn pds_endpoint(document: &Value, did: &str) -> Result<String> {
         }
         return Ok(endpoint.to_string());
     }
-    bail!("DID document declares no #atproto_pds service for {did}")
+    Err(crate::Error::from(ResolutionError::NoPds {
+        did: did.to_string(),
+    })
+    .into())
 }
 
 /// The handle a DID document claims, normalized.
@@ -381,10 +405,10 @@ pub fn declared_handle(document: &Value) -> Option<String> {
 /// `victim.example` can point it at any DID at all.
 pub fn verify_handle_claim(document: &Value, handle: &str) -> Result<()> {
     let wanted = normalize_handle(handle)?;
-    let claimed = declared_handle(document)
-        .context("DID document claims no handle; cannot verify bidirectionally")?;
+    let claimed =
+        declared_handle(document).ok_or(crate::Error::from(ResolutionError::NoClaimedHandle))?;
     if claimed != wanted {
-        bail!("DID document claims handle {claimed:?}, not {wanted:?}");
+        return Err(crate::Error::from(ResolutionError::HandleMismatch { claimed, wanted }).into());
     }
     Ok(())
 }
