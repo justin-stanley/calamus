@@ -109,8 +109,8 @@ pub fn credential_params(
 ///
 /// A fresh `jti` per call, because that claim exists to stop replay.
 ///
-/// **But NOT per retry.** The nonce-challenge retry in the DPoP request path
-/// (`request::send_with_dpop`, which arrives in a later stage) re-sends the identical form body and
+/// **But NOT per retry.** The nonce-challenge retry in
+/// [`crate::request::send_with_dpop`] re-sends the identical form body and
 /// re-mints only the DPoP proof, so the assertion — and its `jti` — is replayed
 /// verbatim. This matches the reference client, which does the same, but an
 /// authorization server that enforces single-use `jti` on client assertions
