@@ -24,6 +24,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -43,7 +44,61 @@ use crate::net::Fetcher;
 /// connect pin ignores the port, so the test URL's own port is what reaches the
 /// server.
 pub fn test_host_override(fetcher: &Fetcher, host: &str, addr: SocketAddr) {
-    fetcher.add_host_override(host, addr);
+    fetcher.overrides.insert(host, addr);
+    fetcher.clients.test_ca.trust();
+}
+
+/// A [`Fetcher`]'s host → address overrides.
+///
+/// **Defined here, and only here, on purpose.** This module does not exist
+/// without `test-util`, so neither does this type: a Fetcher field of this type,
+/// or a call to [`HostOverrides::lookup`], cannot be compiled into a build
+/// without the feature, whatever happens to the `cfg` attributes in `net`. The
+/// seam is absent by construction, not by remembering to gate it.
+#[derive(Debug, Default)]
+pub(crate) struct HostOverrides(Mutex<HashMap<String, SocketAddr>>);
+
+impl HostOverrides {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, SocketAddr>> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn insert(&self, host: &str, addr: SocketAddr) {
+        self.map().insert(host.to_string(), addr);
+    }
+
+    /// The override for `name`, or for `name:port`; the bare host wins.
+    pub(crate) fn lookup(&self, name: &str, port: u16) -> Option<SocketAddr> {
+        let map = self.map();
+        map.get(name)
+            .copied()
+            .or_else(|| map.get(&format!("{name}:{port}")).copied())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+}
+
+/// Whether a Fetcher's pinned clients trust the test CA. Set by
+/// [`test_host_override`] and never otherwise; defined only here for the same
+/// reason as [`HostOverrides`].
+#[derive(Debug, Default)]
+pub(crate) struct TestCaTrust(AtomicBool);
+
+impl TestCaTrust {
+    fn trust(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_trusted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// The hostnames every test leaf carries before any [`register_tls_host`] call:
@@ -69,6 +124,12 @@ static TLS_HOSTS: LazyLock<Mutex<BTreeSet<String>>> =
 /// Register before spawning: a server already running keeps the leaf it was
 /// given. Panics if `host` cannot be a DNS SAN.
 pub fn register_tls_host(host: &str) {
+    let covered = CA_PERMITTED_DNS
+        .iter()
+        .any(|zone| host == *zone || host.ends_with(&format!(".{zone}")));
+    if !covered {
+        panic!("{host:?} is outside the test CA's name constraints ({CA_PERMITTED_DNS:?})");
+    }
     let san: Result<rcgen::SanType, _> = host.try_into().map(rcgen::SanType::DnsName);
     if let Err(e) = san {
         panic!("{host:?} cannot be a certificate SAN: {e}");
@@ -78,6 +139,12 @@ pub fn register_tls_host(host: &str) {
         .unwrap_or_else(|p| p.into_inner())
         .insert(host.to_string());
 }
+
+/// The DNS subtrees the test CA may vouch for, as X.509 name constraints:
+/// `.test` (RFC 2606, never a real host) and `localhost`, which a caller's tests
+/// use for a self-hosted server. A leaf the CA signs for any other name fails
+/// validation, so the test CA cannot be turned against a real host.
+pub const CA_PERMITTED_DNS: &[&str] = &["test", "localhost"];
 
 /// The TEST certificate authority, generated once per process.
 ///
@@ -111,14 +178,20 @@ impl TestPki {
     /// A fresh leaf valid for every hostname registered so far
     /// ([`DEFAULT_TLS_HOSTS`] plus each [`register_tls_host`]).
     pub fn leaf(&self) -> TestLeaf {
-        use rcgen::{CertificateParams, DnType, KeyPair, SanType};
-
         let hosts: Vec<String> = TLS_HOSTS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .cloned()
             .collect();
+        self.leaf_for(hosts)
+    }
+
+    /// A leaf for exactly `hosts`, registered or not: for the test that the CA
+    /// cannot vouch for a name outside its constraints.
+    pub(crate) fn leaf_for(&self, hosts: Vec<String>) -> TestLeaf {
+        use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+
         let mut leaf_params = CertificateParams::default();
         leaf_params
             .distinguished_name
@@ -149,6 +222,13 @@ pub fn test_pki() -> &'static TestPki {
             .distinguished_name
             .push(DnType::CommonName, "calamus test CA");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca_params.name_constraints = Some(rcgen::NameConstraints {
+            permitted_subtrees: CA_PERMITTED_DNS
+                .iter()
+                .map(|zone| rcgen::GeneralSubtree::DnsName((*zone).to_string()))
+                .collect(),
+            excluded_subtrees: Vec::new(),
+        });
         ca_params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
@@ -186,6 +266,17 @@ pub async fn spawn_tls<F>(build_routes: F) -> (SocketAddr, Arc<Mutex<Vec<String>
 where
     F: FnOnce(SocketAddr) -> HashMap<String, Vec<TestResponse>>,
 {
+    spawn_tls_with_leaf(test_pki().leaf(), build_routes).await
+}
+
+/// [`spawn_tls`] presenting a given leaf.
+pub(crate) async fn spawn_tls_with_leaf<F>(
+    leaf: TestLeaf,
+    build_routes: F,
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>)
+where
+    F: FnOnce(SocketAddr) -> HashMap<String, Vec<TestResponse>>,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -211,7 +302,6 @@ where
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     });
 
-    let leaf = test_pki().leaf();
     let certs: Vec<CertificateDer<'static>> = pem_certs(leaf.leaf_pem.as_bytes());
     let key: PrivateKeyDer<'static> = pem_key(leaf.leaf_key_pem.as_bytes());
 

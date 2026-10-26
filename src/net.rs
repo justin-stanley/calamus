@@ -49,8 +49,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(any(test, feature = "test-util"))]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -103,7 +101,30 @@ pub const WORST_CASE_REQUEST: Duration =
 /// rate-limited sanely rather than silently blocked.
 pub const DEFAULT_USER_AGENT: &str = concat!("calamus/", env!("CARGO_PKG_VERSION"));
 
+/// Most redirect hops a [`FetchPolicy`] may allow. Above it the redirect budget
+/// stops being a bound: `usize::MAX` is an endless self-redirect loop.
+pub const POLICY_MAX_REDIRECTS: usize = 20;
+
+/// Largest body cap a [`FetchPolicy`] may set, 64 MiB. Above it the cap stops
+/// defending against a decompression bomb. The smallest is one byte.
+pub const POLICY_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Shortest total or per-read timeout a [`FetchPolicy`] may set. Zero would fail
+/// every request closed, which cannot be meant, so it is refused rather than
+/// honoured.
+pub const POLICY_MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Longest total or per-read timeout a [`FetchPolicy`] may set, 10 minutes.
+/// Above it the timeout is no slowloris defence, and `Duration::MAX` overflows
+/// the deadline arithmetic inside tokio on the first read.
+pub const POLICY_MAX_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// How a [`Fetcher`] bounds and identifies its requests.
+///
+/// [`Fetcher::new`] refuses a policy outside the `POLICY_*` bounds
+/// ([`POLICY_MAX_REDIRECTS`], [`POLICY_MAX_BODY_BYTES`], [`POLICY_MIN_TIMEOUT`],
+/// [`POLICY_MAX_TIMEOUT`]): each of those values would disable a guard or make a
+/// request panic.
 ///
 /// [`FetchPolicy::default`] is FeatherReader's constants: [`FETCH_TIMEOUT`],
 /// [`READ_TIMEOUT`], [`MAX_REDIRECTS`] and [`MAX_BODY_BYTES`], with calamus's own
@@ -135,6 +156,34 @@ impl Default for FetchPolicy {
 }
 
 impl FetchPolicy {
+    /// `Err` naming the first field outside its bound.
+    fn validate(&self) -> Result<()> {
+        if self.max_redirects > POLICY_MAX_REDIRECTS {
+            bail!(
+                "fetch policy max_redirects {} is above {POLICY_MAX_REDIRECTS}",
+                self.max_redirects
+            );
+        }
+        if !(1..=POLICY_MAX_BODY_BYTES).contains(&self.max_body_bytes) {
+            bail!(
+                "fetch policy max_body_bytes {} is outside 1..={POLICY_MAX_BODY_BYTES}",
+                self.max_body_bytes
+            );
+        }
+        for (field, value) in [
+            ("fetch_timeout", self.fetch_timeout),
+            ("read_timeout", self.read_timeout),
+        ] {
+            if !(POLICY_MIN_TIMEOUT..=POLICY_MAX_TIMEOUT).contains(&value) {
+                bail!(
+                    "fetch policy {field} {value:?} is outside \
+                     {POLICY_MIN_TIMEOUT:?}..={POLICY_MAX_TIMEOUT:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Worst-case wall-clock cost of one guarded request under this policy,
     /// redirects included: `(max_redirects + 1) * fetch_timeout`, saturating.
     pub fn worst_case_request(&self) -> Duration {
@@ -437,12 +486,19 @@ fn first_vetted(name: &str, addrs: impl Iterator<Item = SocketAddr>) -> Result<S
 /// Sync`; a `static` or an `Arc` both work). See the module documentation.
 pub struct Fetcher {
     policy: FetchPolicy,
-    clients: PinnedClients,
+    pub(crate) clients: PinnedClients,
     /// Host → address overrides that skip DNS **and** the forbidden-IP check for
     /// that host. Only exists with `test-util` (or in this crate's own tests),
     /// and starts empty; only `calamus::testing::test_host_override` adds to it.
+    ///
+    /// **Its type is defined only in `crate::testing`, by construction.** The
+    /// table, its lookup and its insert are methods of that type, so removing
+    /// the `cfg` from this field, its initialiser or the lookup in
+    /// `resolve_and_check` fails to compile in a build without `test-util`,
+    /// rather than quietly shipping a bypass. Fetcher itself has no override
+    /// method at all.
     #[cfg(any(test, feature = "test-util"))]
-    overrides: Mutex<HashMap<String, SocketAddr>>,
+    pub(crate) overrides: crate::testing::HostOverrides,
 }
 
 impl std::fmt::Debug for Fetcher {
@@ -450,14 +506,7 @@ impl std::fmt::Debug for Fetcher {
         let mut d = f.debug_struct("Fetcher");
         d.field("policy", &self.policy);
         #[cfg(any(test, feature = "test-util"))]
-        d.field(
-            "host_overrides",
-            &self
-                .overrides
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .len(),
-        );
+        d.field("host_overrides", &self.overrides.len());
         d.finish_non_exhaustive()
     }
 }
@@ -470,9 +519,11 @@ impl Default for Fetcher {
 }
 
 impl Fetcher {
-    /// A Fetcher bounded by `policy`. Refuses a User-Agent that cannot be sent as
-    /// a header value, here rather than on the first request.
+    /// A Fetcher bounded by `policy`. Refuses, here rather than on the first
+    /// request, a User-Agent that cannot be sent as a header value and any value
+    /// outside the `POLICY_*` bounds (see [`FetchPolicy`]).
     pub fn new(policy: FetchPolicy) -> Result<Self> {
+        policy.validate()?;
         HeaderValue::from_str(&policy.user_agent).with_context(|| {
             format!(
                 "the User-Agent {:?} is not a valid header value",
@@ -483,39 +534,13 @@ impl Fetcher {
             clients: PinnedClients::new(policy.clone()),
             policy,
             #[cfg(any(test, feature = "test-util"))]
-            overrides: Mutex::new(HashMap::new()),
+            overrides: crate::testing::HostOverrides::default(),
         })
     }
 
     /// The policy this Fetcher was built with.
     pub fn policy(&self) -> &FetchPolicy {
         &self.policy
-    }
-
-    /// Point `host` at `addr` for this Fetcher, bypassing DNS **and** the
-    /// forbidden-IP check for that host only, and trust the test CA from now on.
-    ///
-    /// Bypassing the IP check is the entire point: a test server is on loopback,
-    /// which the guard is right to refuse. Only the registered host is exempt —
-    /// anything else, including every redirect target, still goes through the
-    /// real check. That is what makes a redirect test meaningful.
-    ///
-    /// Reached only through `calamus::testing::test_host_override`.
-    #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn add_host_override(&self, host: &str, addr: SocketAddr) {
-        self.overrides
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(host.to_string(), addr);
-        self.clients.trust_test_ca();
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    fn override_for(&self, name: &str, port: u16) -> Option<SocketAddr> {
-        let map = self.overrides.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(name)
-            .copied()
-            .or_else(|| map.get(&format!("{name}:{port}")).copied())
     }
 
     /// Resolve a URL's host to socket addresses, reject if *any* resolved IP is
@@ -556,7 +581,7 @@ impl Fetcher {
                 // loopback, which `is_forbidden_ip` correctly refuses, so nothing
                 // could ever drive a real redirect through this function.
                 #[cfg(any(test, feature = "test-util"))]
-                if let Some(addr) = self.override_for(name, port) {
+                if let Some(addr) = self.overrides.lookup(name, port) {
                     return Ok(addr);
                 }
                 let addrs = tokio::net::lookup_host((name, port))
@@ -658,8 +683,10 @@ impl Fetcher {
         max_redirects: usize,
     ) -> Result<Response> {
         let mut current = Url::parse(url).with_context(|| format!("not a valid URL {url:?}"))?;
-        // The origin the caller's credentials belong to; a hop off it drops them.
+        // The origin the caller's credentials belong to; a hop off it drops them,
+        // and once dropped they stay dropped (see `hop_headers`).
         let original = current.clone();
+        let mut left_origin = false;
 
         for _ in 0..=max_redirects {
             check_scheme(&current)?;
@@ -684,7 +711,11 @@ impl Fetcher {
             // while the hop is still on the ORIGINAL origin: a hostile upstream
             // must not be able to `302` a caller's bearer token onto a host it
             // controls.
-            for (name, value) in hop_headers(&original, &current, extra_headers) {
+            left_origin |= !same_origin(&original, &current);
+            for (name, value) in hop_headers(&original, &current, extra_headers)
+                .into_iter()
+                .filter(|(name, _)| !(left_origin && is_sensitive_header(name)))
+            {
                 req = req.header(name.clone(), value.clone());
             }
             let resp = req
@@ -947,7 +978,7 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 ///   moves to a different address MISSES the cache and gets a client pinned to
 ///   the new one. A pooled connection can only ever be reused for an address
 ///   that was just re-vetted this request.
-struct PinnedClients {
+pub(crate) struct PinnedClients {
     policy: FetchPolicy,
     entries: Mutex<HashMap<(String, SocketAddr), (Client, Instant)>>,
     /// How many clients have actually been constructed. Test-only bookkeeping:
@@ -956,8 +987,9 @@ struct PinnedClients {
     builds: AtomicUsize,
     /// Whether clients built from now on trust the test CA. Set only when a test
     /// gives the owning Fetcher a host override; absent without `test-util`.
+    /// Like the override table, its type exists only in `crate::testing`.
     #[cfg(any(test, feature = "test-util"))]
-    test_ca: AtomicBool,
+    pub(crate) test_ca: crate::testing::TestCaTrust,
 }
 
 impl PinnedClients {
@@ -967,18 +999,8 @@ impl PinnedClients {
             entries: Mutex::new(HashMap::new()),
             builds: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-util"))]
-            test_ca: AtomicBool::new(false),
+            test_ca: crate::testing::TestCaTrust::default(),
         }
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    fn trust_test_ca(&self) {
-        self.test_ca.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    fn trusts_test_ca(&self) -> bool {
-        self.test_ca.load(Ordering::SeqCst)
     }
 
     /// A client pinned to `addr` for `host`, reusing a pooled one when the
@@ -1041,7 +1063,7 @@ impl PinnedClients {
         // attribute here fails to compile rather than silently trusting an extra
         // root in a release build.
         #[cfg(any(test, feature = "test-util"))]
-        let builder = if self.trusts_test_ca() {
+        let builder = if self.test_ca.is_trusted() {
             builder.add_root_certificate(crate::testing::test_ca_certificate()?)
         } else {
             builder
@@ -1138,10 +1160,15 @@ fn same_origin(a: &Url, b: &Url) -> bool {
 /// The headers to apply on THIS hop: all of `extra` while we are still on the
 /// original origin, otherwise only the non-sensitive ones.
 ///
-/// The comparison base is the **original** URL rather than the previous hop (what
-/// reqwest does). That is strictly stricter: an `a → b → a` redirect chain never
-/// re-attaches the credential, at the cost of a small, deliberate divergence from
-/// the stock client's behaviour.
+/// The comparison base is the **original** URL rather than the previous hop.
+/// On its own that is NOT enough for what this comment used to claim, that "an
+/// `a → b → a` redirect chain never re-attaches the credential": the hop back to
+/// `a` is same-origin with the original again, so this function alone returns
+/// the credential for it. `Fetcher::get` therefore also drops credentials on
+/// every hop after the first one that left the origin (`left_origin`), which is
+/// what makes the claim true; `credentials_are_not_reattached_when_a_redirect_
+/// returns_to_the_origin` pins it. (FeatherReader's `guarded_get_inner` called
+/// this function alone, so it did re-attach.)
 fn hop_headers<'a>(
     original: &Url,
     current: &Url,
@@ -3329,18 +3356,18 @@ mod tests {
     async fn the_default_fetcher_has_no_host_overrides() {
         let fetcher = Fetcher::default();
         assert!(
-            fetcher.overrides.lock().unwrap().is_empty(),
+            fetcher.overrides.is_empty(),
             "a default Fetcher came with host overrides"
         );
         assert!(
-            !fetcher.clients.trusts_test_ca(),
+            !fetcher.clients.test_ca.is_trusted(),
             "a default Fetcher trusts the test CA"
         );
 
         let (addr, log) = spawn_http(vec![ok_200()]).await;
         let overridden = Fetcher::default();
         test_host_override(&overridden, "localhost", addr);
-        assert!(overridden.clients.trusts_test_ca());
+        assert!(overridden.clients.test_ca.is_trusted());
         let url = format!("http://localhost:{}/probe", addr.port());
 
         overridden
@@ -3362,7 +3389,7 @@ mod tests {
             "the default Fetcher's request reached the test server"
         );
         assert!(
-            fetcher.overrides.lock().unwrap().is_empty(),
+            fetcher.overrides.is_empty(),
             "another Fetcher's registration leaked into this one"
         );
     }
@@ -3648,5 +3675,364 @@ mod tests {
         .await
         .expect("a host registered before the server was spawned was not in its leaf");
         assert!(ok.status().is_success());
+    }
+
+    // ── review fixes (stage 3 security review) ───────────────────────────────
+
+    /// **L1/L2: a policy that disables a guard, or that panics later, is refused
+    /// when the Fetcher is built.** `max_redirects: usize::MAX` is an endless
+    /// self-redirect loop, `max_body_bytes: usize::MAX` is no decompression-bomb
+    /// cap, and `read_timeout: Duration::MAX` made the first body read panic
+    /// inside tokio ("overflow when adding duration to instant"). A zero timeout
+    /// would fail every request closed; it is refused too, as a configuration
+    /// that cannot be meant.
+    #[test]
+    fn a_policy_that_disables_a_guard_is_refused() {
+        let d = FetchPolicy::default;
+        let cases = [
+            (
+                "endless redirects",
+                FetchPolicy {
+                    max_redirects: usize::MAX,
+                    ..d()
+                },
+                "max_redirects",
+            ),
+            (
+                "21 redirects",
+                FetchPolicy {
+                    max_redirects: 21,
+                    ..d()
+                },
+                "max_redirects",
+            ),
+            (
+                "an uncapped body",
+                FetchPolicy {
+                    max_body_bytes: usize::MAX,
+                    ..d()
+                },
+                "max_body_bytes",
+            ),
+            (
+                "64 MiB + 1",
+                FetchPolicy {
+                    max_body_bytes: 64 * 1024 * 1024 + 1,
+                    ..d()
+                },
+                "max_body_bytes",
+            ),
+            (
+                "a zero body cap",
+                FetchPolicy {
+                    max_body_bytes: 0,
+                    ..d()
+                },
+                "max_body_bytes",
+            ),
+            (
+                "Duration::MAX read",
+                FetchPolicy {
+                    read_timeout: Duration::MAX,
+                    ..d()
+                },
+                "read_timeout",
+            ),
+            (
+                "a zero read timeout",
+                FetchPolicy {
+                    read_timeout: Duration::ZERO,
+                    ..d()
+                },
+                "read_timeout",
+            ),
+            (
+                "a sub-millisecond read timeout",
+                FetchPolicy {
+                    read_timeout: Duration::from_micros(999),
+                    ..d()
+                },
+                "read_timeout",
+            ),
+            (
+                "an 11-minute read timeout",
+                FetchPolicy {
+                    read_timeout: Duration::from_secs(601),
+                    ..d()
+                },
+                "read_timeout",
+            ),
+            (
+                "Duration::MAX fetch",
+                FetchPolicy {
+                    fetch_timeout: Duration::MAX,
+                    ..d()
+                },
+                "fetch_timeout",
+            ),
+            (
+                "a zero fetch timeout",
+                FetchPolicy {
+                    fetch_timeout: Duration::ZERO,
+                    ..d()
+                },
+                "fetch_timeout",
+            ),
+            (
+                "an 11-minute fetch timeout",
+                FetchPolicy {
+                    fetch_timeout: Duration::from_secs(601),
+                    ..d()
+                },
+                "fetch_timeout",
+            ),
+        ];
+        for (what, policy, field) in cases {
+            let err = Fetcher::new(policy).expect_err(what);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(field),
+                "{what}: the error does not name {field}: {msg}"
+            );
+        }
+    }
+
+    /// The bounds are inclusive, and the defaults sit inside them.
+    #[test]
+    fn the_policy_bounds_admit_their_endpoints_and_the_defaults() {
+        let d = FetchPolicy::default;
+        for policy in [
+            d(),
+            FetchPolicy {
+                max_redirects: 0,
+                ..d()
+            },
+            FetchPolicy {
+                max_redirects: 20,
+                ..d()
+            },
+            FetchPolicy {
+                max_body_bytes: 1,
+                ..d()
+            },
+            FetchPolicy {
+                max_body_bytes: 64 * 1024 * 1024,
+                ..d()
+            },
+            FetchPolicy {
+                read_timeout: Duration::from_millis(1),
+                fetch_timeout: Duration::from_millis(1),
+                ..d()
+            },
+            FetchPolicy {
+                read_timeout: Duration::from_secs(600),
+                fetch_timeout: Duration::from_secs(600),
+                ..d()
+            },
+        ] {
+            Fetcher::new(policy.clone())
+                .unwrap_or_else(|e| panic!("{policy:?} was refused: {e:#}"));
+        }
+    }
+
+    /// **L3: the hop policy runs before the host is resolved.** The URL resolves
+    /// nowhere (`.invalid`, RFC 2606) and has no override, so if the policy ran
+    /// after `resolve_and_check` the error would be a resolution failure. It must
+    /// be the policy's own error, unchanged: DNS is never consulted for a URL the
+    /// caller refused.
+    #[tokio::test]
+    async fn the_hop_policy_runs_before_the_host_is_resolved() {
+        let fetcher = Fetcher::default();
+        let refuse = |url: &Url| -> Result<()> { bail!("policy refused {url} before resolution") };
+        let err = fetcher
+            .get("http://refused-unresolvable.invalid/feed", &[], &refuse)
+            .await
+            .expect_err("a refused URL was fetched");
+        assert_eq!(
+            format!("{err:#}"),
+            "policy refused http://refused-unresolvable.invalid/feed before resolution",
+            "the policy did not run first: the host was resolved before it was refused"
+        );
+    }
+
+    /// **L4: only a Fetcher given an override trusts the test CA.** Both clients
+    /// are pinned straight to the TLS test server, so trust is the only
+    /// difference: the untouched Fetcher refuses the certificate, the overridden
+    /// one accepts it.
+    #[tokio::test]
+    async fn only_a_fetcher_given_an_override_trusts_the_test_ca() {
+        let (addr, _log) = spawn_tls(|_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert("/ok".to_string(), vec![TestResponse::json(200, "{}")]);
+            r
+        })
+        .await;
+        let url = format!("https://feed-tls.test:{}/ok", addr.port());
+
+        let untouched = Fetcher::default();
+        let err = untouched
+            .pinned_client("feed-tls.test", addr)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("a Fetcher with no override trusted the test CA");
+        let msg = format!("{:#}", anyhow::Error::from(err)).to_ascii_lowercase();
+        assert!(
+            msg.contains("unknownissuer") || msg.contains("invalid peer certificate"),
+            "failed, but not on the certificate: {msg}"
+        );
+
+        let overridden = Fetcher::default();
+        test_host_override(&overridden, "feed-tls.test", addr);
+        let resp = overridden
+            .pinned_client("feed-tls.test", addr)
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .expect("a Fetcher given an override did not trust the test CA");
+        assert!(resp.status().is_success());
+    }
+
+    /// **N2: credentials are compared against the ORIGINAL origin, not the
+    /// previous hop.** An `a → b → a` chain must not re-attach the bearer token
+    /// when it comes back to `a`: the return hop is whatever `b` chose, and `b` is
+    /// not trusted with it.
+    #[tokio::test]
+    async fn credentials_are_not_reattached_when_a_redirect_returns_to_the_origin() {
+        let fetcher = Fetcher::default();
+        let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_port = a_listener.local_addr().unwrap().port();
+        let (b_addr, b_log) = spawn_http(vec![redirect_to(&format!(
+            "http://cred-return-a.test:{a_port}/back"
+        ))])
+        .await;
+        test_host_override(&fetcher, "cred-return-b.test", b_addr);
+        let (a_addr, a_log) = spawn_http_on(
+            a_listener,
+            vec![
+                redirect_to(&format!("http://cred-return-b.test:{}/away", b_addr.port())),
+                ok_200(),
+            ],
+        )
+        .await;
+        test_host_override(&fetcher, "cred-return-a.test", a_addr);
+
+        let resp = fetcher
+            .get(
+                &format!("http://cred-return-a.test:{a_port}/start"),
+                &[(
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer return-secret"),
+                )],
+                &feed_privacy,
+            )
+            .await
+            .expect("the a -> b -> a chain");
+        assert!(resp.status().is_success());
+
+        let a = a_log.lock().unwrap().clone();
+        let b = b_log.lock().unwrap().clone();
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!(
+            a[0].contains("return-secret"),
+            "the first hop lost the token:\n{}",
+            a[0]
+        );
+        assert!(b[0].starts_with("GET /away"), "{}", b[0]);
+        assert!(
+            !b[0].contains("return-secret"),
+            "the token reached b:\n{}",
+            b[0]
+        );
+        assert!(a[1].starts_with("GET /back"), "{}", a[1]);
+        assert!(
+            !a[1].to_ascii_lowercase().contains("authorization:"),
+            "the token was re-attached on the hop back to the origin:\n{}",
+            a[1]
+        );
+    }
+
+    /// **N3: a POST refuses every redirect status it could otherwise follow**,
+    /// not only `307` — `301`/`302`/`303` are refused as well, on both POST
+    /// shapes, and the target is never contacted.
+    #[tokio::test]
+    async fn a_post_refuses_every_followable_redirect_status() {
+        for status in [301, 302, 303, 307, 308] {
+            let fetcher = Fetcher::default();
+            let (elsewhere_addr, elsewhere_log) = spawn_http(vec![ok_200()]).await;
+            test_host_override(&fetcher, "post-every-elsewhere.test", elsewhere_addr);
+            let (addr, log) = spawn_http(vec![format!(
+                "HTTP/1.1 {status} Redirect\r\nLocation: http://post-every-elsewhere.test:{}/token\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n",
+                elsewhere_addr.port()
+            )])
+            .await;
+            test_host_override(&fetcher, "post-every.test", addr);
+            let url = format!("http://post-every.test:{}/token", addr.port());
+
+            let form = fetcher
+                .post_form(&url, &[], &[("code", "SECRET-CODE")])
+                .await;
+            let json = fetcher
+                .post_json(&url, &[], b"{\"secret\":1}".to_vec())
+                .await;
+            for (shape, result) in [("form", form), ("json", json)] {
+                let err = result.expect_err(&format!("a {shape} POST accepted a {status}"));
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains(&status.to_string()) && msg.contains("re-send the request body"),
+                    "{status} {shape}: refused for the wrong reason: {msg}"
+                );
+            }
+            assert_eq!(log.lock().unwrap().len(), 2, "{status}");
+            assert_eq!(
+                elsewhere_log.lock().unwrap().len(),
+                0,
+                "{status}: the body followed the redirect"
+            );
+        }
+    }
+
+    /// **N1: the test CA cannot vouch for a name outside `.test` and
+    /// `localhost`.** It carries X.509 name constraints, so even a leaf it signs
+    /// for another name — here built directly, since registration refuses one —
+    /// fails validation. A leaked test CA could otherwise mint a certificate for
+    /// any real host a test-util client talks to.
+    #[tokio::test]
+    async fn the_test_ca_cannot_vouch_for_a_name_outside_its_constraints() {
+        let leaf = crate::testing::test_pki().leaf_for(vec!["outside-constraints.example".into()]);
+        let (addr, _log) = crate::testing::spawn_tls_with_leaf(leaf, |_| {
+            let mut r = std::collections::HashMap::new();
+            r.insert("/ok".to_string(), vec![TestResponse::json(200, "{}")]);
+            r
+        })
+        .await;
+        let fetcher = Fetcher::default();
+        test_host_override(&fetcher, "outside-constraints.example", addr);
+        let err = guarded_get_for_a_verdict(
+            &fetcher,
+            &format!("https://outside-constraints.example:{}/ok", addr.port()),
+        )
+        .await
+        .expect_err("the test CA vouched for a name outside its constraints");
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        // Without the constraints this same request succeeds (checked when the
+        // test was written), so the refusal is the constraint's.
+        assert!(
+            msg.contains("invalid peer certificate"),
+            "failed, but not on the certificate: {msg}"
+        );
+        assert!(!is_timeout(&err), "{msg}");
+    }
+
+    /// Registration refuses a name the CA's constraints would not cover, at the
+    /// call rather than as a confusing handshake failure later.
+    #[test]
+    #[should_panic(expected = "outside the test CA's name constraints")]
+    fn registering_a_tls_host_outside_the_constraints_panics() {
+        crate::testing::register_tls_host("example.com");
     }
 }
