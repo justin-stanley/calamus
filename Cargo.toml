@@ -1,0 +1,24 @@
+[package]
+name = "calamus"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.94"
+description = "An atproto OAuth client: identity resolution, discovery, PAR + PKCE + DPoP, private_key_jwt, sessions, revocation, and an SSRF-guarded fetcher."
+# The code is extracted from FeatherReader (AGPL-3.0-only). Until the owner chooses
+# calamus's own license, it stays under FeatherReader's, and the crate is not published.
+license = "AGPL-3.0-only"
+publish = false
+repository = "https://git.justin-stanley.com/justin/calamus"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+getrandom = "0.4"
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
