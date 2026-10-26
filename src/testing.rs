@@ -782,3 +782,287 @@ impl crate::resolve::DnsResolver for StaticDns {
         }
     }
 }
+
+/// A contract suite for the storage seams, for any implementation of
+/// [`SessionStore`](crate::store::SessionStore) and
+/// [`PendingLoginStore`](crate::store::PendingLoginStore).
+///
+/// calamus runs it against [`crate::store::memory`]; an implementation over a
+/// database (FeatherReader's SQLite store) runs the same functions against
+/// its own, so both are held to one definition of what the refresh and
+/// sign-out races rely on. Each function needs an EMPTY store, and panics with
+/// the broken rule's name on the first violation.
+///
+/// What it pins, from FeatherReader's `store.rs`:
+///
+/// * a session round-trips, and `put` replaces (re-login is an upsert);
+/// * a [`Version`](crate::store::SessionStore::Version) is the row as read, and
+///   ANY later write changes it, even one storing identical values;
+/// * `update_if_unchanged` writes only over the version it was given: false
+///   (and nothing written) after a concurrent rewrite, and false (no
+///   resurrection) after a delete;
+/// * `delete_if_unchanged` deletes only the version that was read;
+/// * a pending login's `take` is single-use, refuses a row at or past its
+///   expiry (and removes it anyway), and a second `put` under one `state` is
+///   refused rather than replacing the first.
+pub mod store_contract {
+    use crate::client_auth::AuthMethod;
+    use crate::store::{PendingLogin, PendingLoginStore, Session, SessionStore};
+
+    const NOW: i64 = 1_700_000_000;
+    const SUB: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    const OTHER_SUB: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn session(sub: &str, refresh: &str) -> Session {
+        Session {
+            sub: sub.into(),
+            issuer: "https://auth.example.com".into(),
+            aud: "https://pds.example.com".into(),
+            dpop_key_jwk: r#"{"kty":"EC","d":"k"}"#.into(),
+            access_token: format!("access-for-{refresh}"),
+            refresh_token: refresh.into(),
+            token_type: "DPoP".into(),
+            granted_scope: "atproto".into(),
+            expires_at: Some(NOW + 3600),
+        }
+    }
+
+    fn pending_login(state: &str, expires_at: i64) -> PendingLogin {
+        PendingLogin {
+            state: state.into(),
+            browser_binding_hash: "binding-hash".into(),
+            pkce_verifier: "verifier".into(),
+            dpop_key_jwk: r#"{"kty":"EC","d":"k"}"#.into(),
+            issuer: "https://auth.example.com".into(),
+            pds_url: "https://pds.example.com".into(),
+            did: SUB.into(),
+            auth_method: AuthMethod::PrivateKeyJwt,
+            auth_kid: Some("client-kid".into()),
+            redirect_uri: "https://client.example/oauth/callback".into(),
+            requested_scope: "atproto".into(),
+            request_uri: "urn:ietf:params:oauth:request_uri:x".into(),
+            app_return_to: Some("/after".into()),
+            expires_at,
+        }
+    }
+
+    /// Run every [`SessionStore`] rule against `store`, which must be empty.
+    pub async fn sessions<S: SessionStore>(store: &S) {
+        // Absent.
+        assert_eq!(store.get(SUB).await.unwrap(), None, "absent: get");
+        assert!(
+            store.get_versioned(SUB).await.unwrap().is_none(),
+            "absent: get_versioned"
+        );
+        assert!(
+            !store.delete(SUB).await.unwrap(),
+            "absent: delete reported a row"
+        );
+
+        // Round trip, and both reads agree.
+        let first = session(SUB, "r1");
+        store.put(&first).await.unwrap();
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            Some(first.clone()),
+            "round trip"
+        );
+        let (read, v1) = store.get_versioned(SUB).await.unwrap().expect("round trip");
+        assert_eq!(read, first, "get_versioned returned a different session");
+        let (_, v1_again) = store.get_versioned(SUB).await.unwrap().unwrap();
+        assert!(
+            v1 == v1_again,
+            "two reads of an unwritten row disagree on its version"
+        );
+
+        // `put` replaces: a re-login is an upsert, not a refused insert.
+        let relogin = session(SUB, "r2");
+        store.put(&relogin).await.unwrap();
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            Some(relogin.clone()),
+            "put did not replace"
+        );
+        let (_, v2) = store.get_versioned(SUB).await.unwrap().unwrap();
+        assert!(v1 != v2, "a rewrite left the version unchanged");
+
+        // update_if_unchanged: false after a concurrent rewrite, nothing written.
+        let ours = session(SUB, "ours");
+        assert!(
+            !store.update_if_unchanged(&ours, &v1).await.unwrap(),
+            "update_if_unchanged wrote over a row rewritten since its version was read"
+        );
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            Some(relogin.clone()),
+            "a refused update_if_unchanged still changed the row"
+        );
+
+        // ...true over the version it was given, and that write is a new version.
+        assert!(
+            store.update_if_unchanged(&ours, &v2).await.unwrap(),
+            "update_if_unchanged refused the current version"
+        );
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            Some(ours.clone()),
+            "update not stored"
+        );
+        let (_, v3) = store.get_versioned(SUB).await.unwrap().unwrap();
+        assert!(v3 != v2, "update_if_unchanged left the version unchanged");
+        assert!(
+            !store
+                .update_if_unchanged(&session(SUB, "again"), &v2)
+                .await
+                .unwrap(),
+            "a version was usable twice"
+        );
+
+        // Any write changes the version, even one storing identical values.
+        store.put(&ours).await.unwrap();
+        let (_, v4) = store.get_versioned(SUB).await.unwrap().unwrap();
+        assert!(
+            v4 != v3,
+            "rewriting identical values left the version unchanged"
+        );
+        assert!(
+            !store.delete_if_unchanged(SUB, &v3).await.unwrap(),
+            "delete_if_unchanged deleted a row rewritten (with identical values) since"
+        );
+
+        // delete_if_unchanged: only the version that was read.
+        assert!(
+            store.get(SUB).await.unwrap().is_some(),
+            "a refused delete_if_unchanged deleted"
+        );
+        assert!(
+            store.delete_if_unchanged(SUB, &v4).await.unwrap(),
+            "delete_if_unchanged refused the current version"
+        );
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            None,
+            "delete_if_unchanged left the row"
+        );
+        assert!(
+            !store.delete_if_unchanged(SUB, &v4).await.unwrap(),
+            "delete_if_unchanged reported deleting an absent row"
+        );
+
+        // No resurrection: an update over a deleted row writes nothing.
+        assert!(
+            !store.update_if_unchanged(&ours, &v4).await.unwrap(),
+            "update_if_unchanged reported writing a deleted row"
+        );
+        assert_eq!(
+            store.get(SUB).await.unwrap(),
+            None,
+            "update_if_unchanged RESURRECTED a deleted session"
+        );
+
+        // Subjects are independent, and delete reports what it did.
+        store.put(&session(SUB, "a")).await.unwrap();
+        store.put(&session(OTHER_SUB, "b")).await.unwrap();
+        let (_, other_version) = store.get_versioned(OTHER_SUB).await.unwrap().unwrap();
+        assert!(
+            store.delete(SUB).await.unwrap(),
+            "delete did not report the row"
+        );
+        assert!(
+            !store.delete(SUB).await.unwrap(),
+            "delete reported a row twice"
+        );
+        assert_eq!(
+            store.get(OTHER_SUB).await.unwrap(),
+            Some(session(OTHER_SUB, "b")),
+            "deleting one subject touched another"
+        );
+        assert!(
+            !store
+                .update_if_unchanged(&session(SUB, "x"), &other_version)
+                .await
+                .unwrap(),
+            "one subject's version updated another subject's row"
+        );
+        assert_eq!(store.get(SUB).await.unwrap(), None);
+        assert!(store.delete(OTHER_SUB).await.unwrap());
+    }
+
+    /// Run every [`PendingLoginStore`] rule against `store`, which must be
+    /// empty.
+    pub async fn pending<P: PendingLoginStore>(store: &P) {
+        assert_eq!(
+            store.take("unknown", NOW).await.unwrap(),
+            None,
+            "absent: take"
+        );
+
+        // Round trip, single use.
+        let live = pending_login("s-live", NOW + 600);
+        store.put(&live).await.unwrap();
+        assert_eq!(
+            store.take("s-live", NOW).await.unwrap(),
+            Some(live.clone()),
+            "round trip"
+        );
+        assert_eq!(
+            store.take("s-live", NOW).await.unwrap(),
+            None,
+            "a pending login was taken twice"
+        );
+
+        // Two takes racing: exactly one wins.
+        store
+            .put(&pending_login("s-race", NOW + 600))
+            .await
+            .unwrap();
+        let (a, b) = tokio::join!(store.take("s-race", NOW), store.take("s-race", NOW));
+        let winners = [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|t| t.is_some())
+            .count();
+        assert_eq!(winners, 1, "concurrent takes of one state: {winners} won");
+
+        // Expired AT `expires_at`, and removed regardless.
+        store.put(&pending_login("s-edge", NOW)).await.unwrap();
+        assert_eq!(
+            store.take("s-edge", NOW).await.unwrap(),
+            None,
+            "a row was accepted at its expiry"
+        );
+        assert_eq!(
+            store.take("s-edge", NOW - 1).await.unwrap(),
+            None,
+            "an expired take left the row behind"
+        );
+        store.put(&pending_login("s-just", NOW + 1)).await.unwrap();
+        assert!(
+            store.take("s-just", NOW).await.unwrap().is_some(),
+            "a row was refused a second before its expiry"
+        );
+
+        // A second put under a pending state is refused, and the first stands.
+        let first = pending_login("s-dup", NOW + 600);
+        store.put(&first).await.unwrap();
+        let mut second = pending_login("s-dup", NOW + 600);
+        second.issuer = "https://evil.example".into();
+        assert!(
+            store.put(&second).await.is_err(),
+            "a put replaced a pending login under the same state"
+        );
+        assert_eq!(
+            store.take("s-dup", NOW).await.unwrap(),
+            Some(first),
+            "a refused put changed the pending login"
+        );
+
+        // States are independent.
+        store.put(&pending_login("s-one", NOW + 600)).await.unwrap();
+        store.put(&pending_login("s-two", NOW + 600)).await.unwrap();
+        assert!(store.take("s-one", NOW).await.unwrap().is_some());
+        assert!(
+            store.take("s-two", NOW).await.unwrap().is_some(),
+            "taking one state consumed another"
+        );
+    }
+}

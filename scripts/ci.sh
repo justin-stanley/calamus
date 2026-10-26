@@ -10,6 +10,11 @@ cargo fmt --all --check
 cargo build --all-targets --all-features --locked
 cargo test --all-features --locked
 cargo clippy --all-targets --all-features -- -D warnings
+# And with no optional features at all (no `dns`, no `revoke`, no `test-util`):
+# the core revocation request and the refresh path that needs it are always
+# built, and an item used only by a gated feature must be gated with it.
+cargo test --no-default-features --locked
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 # And with default features: a link to a feature-gated item breaks only there.
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked

@@ -40,6 +40,8 @@ pub mod metadata;
 pub mod net;
 pub mod request;
 pub mod resolve;
+pub mod revoke;
+pub mod session;
 pub mod store;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;

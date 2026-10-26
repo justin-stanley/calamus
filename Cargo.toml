@@ -34,7 +34,7 @@ subtle = "2"
 thiserror = "2"
 # `net` needs only the resolver (`lookup_host`); `test-util` adds what its test
 # servers need.
-tokio = { version = "1.45", features = ["net"] }
+tokio = { version = "1.45", features = ["net", "sync", "time"] }
 tracing = "0.1"
 url = "2"
 
@@ -55,12 +55,17 @@ default = ["dns"]
 # `resolve::SystemResolver`: DNS TXT lookups through hickory with the host's own
 # resolver configuration.
 dns = ["dep:hickory-resolver"]
+# `revoke::{sign_out, sign_out_with}`: revoke a session's tokens, then delete it
+# from a `store::SessionStore`, bounded and safe against a concurrent refresh.
+# The RFC 7009 request itself (`revoke::{try_revoke, revoke_tokens,
+# revoke_orphaned}`) is always built: the refresh path needs it.
+revoke = []
 # Test helpers for crates that depend on calamus: `client_auth::record_evidence`
 # and `calamus::testing` (the test CA, TLS and HTTP test servers, and per-Fetcher
 # host overrides, which deliberately bypass the SSRF guard for named hosts).
 # Never enable it outside [dev-dependencies]; scripts/ci.sh proves it is absent
 # from a default build.
-test-util = ["dep:rcgen", "dep:tokio-rustls", "tokio/io-util", "tokio/rt"]
+test-util = ["dep:rcgen", "dep:tokio-rustls", "tokio/io-util", "tokio/macros", "tokio/rt"]
 
 [lints.rust]
 unsafe_code = "forbid"

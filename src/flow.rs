@@ -11,15 +11,14 @@
 //! attacker can start a login with their own account and induce a victim's
 //! browser to fetch the resulting callback URL, and the victim ends up holding a
 //! session for the attacker's account — reading their feeds, writing into their
-//! repo. The browser-binding cookie ([`binding_matches`]) is what closes that.
+//! repo. The browser-binding cookie ([`binding_matches`]) is what closes that,
+//! and [`complete_callback`] exists so the check cannot be left out — it
+//! consumes the pending login, verifies the binding, and validates the response
+//! as one operation, rather than three functions a caller must remember to
+//! chain.
 //!
-//! Ported from FeatherReader `src/oauth/flow.rs`, without `complete_callback`:
-//! that function consumes the pending login from its store, checks the binding,
-//! and validates the callback as one operation, so that the binding check cannot
-//! be left out. It needs the pending-login store, and arrives with the
-//! `PendingLoginStore` trait in a later stage. Until then a caller must chain the
-//! three steps itself: take the pending row atomically, [`binding_matches`],
-//! then [`verify_callback`] against the row's issuer.
+//! Ported from FeatherReader `src/oauth/flow.rs`; `complete_callback` takes the
+//! pending login from a [`PendingLoginStore`] instead of SQLite.
 
 use anyhow::{bail, Context as _, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -27,6 +26,8 @@ use base64::Engine;
 use ring::digest::{digest, SHA256};
 use serde_json::Value;
 use subtle::ConstantTimeEq;
+
+use crate::store::{PendingLogin, PendingLoginStore};
 
 /// 32 CSPRNG bytes as unpadded base64url is 43 characters — the minimum RFC 7636
 /// permits, and the standard choice.
@@ -253,9 +254,8 @@ pub struct CallbackParams {
 /// attacker bypass the check by simply omitting the parameter. That is the
 /// mix-up attack RFC 9207 exists to stop.
 ///
-/// This does NOT check `state` or the browser binding: those need the stored row,
-/// and the row must be consumed atomically first, from the caller's pending-login
-/// store, and then checked with [`binding_matches`].
+/// This does NOT check `state` or the browser binding: those need the stored row.
+/// [`complete_callback`] does all three.
 pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result<String> {
     if params.response.is_some() {
         bail!("authorization response uses JARM, which is not supported");
@@ -300,9 +300,55 @@ pub fn verify_callback(params: &CallbackParams, expected_issuer: &str) -> Result
     Ok(code.to_string())
 }
 
+/// Consume the pending login, check the browser binding, and validate the
+/// callback — in that order, as one operation.
+///
+/// These three steps were previously three free functions with nothing forcing
+/// the middle one to happen. That matters more than it sounds: the binding check
+/// is the single control standing between a server-global `state` table and a
+/// login-CSRF that hands a victim a session for the attacker's account. A caller
+/// that forgot it would still compile, still pass every test, and still work
+/// perfectly for every non-malicious login. Returning the code only from here
+/// makes the omission unrepresentable rather than merely discouraged.
+///
+/// The row is consumed **whatever happens next**, including a binding failure —
+/// so a mismatched cookie cannot simply be retried.
+pub async fn complete_callback(
+    store: &impl PendingLoginStore,
+    params: &CallbackParams,
+    presented_cookie: Option<&str>,
+    now: i64,
+) -> Result<(PendingLogin, String)> {
+    if params.response.is_some() {
+        bail!("authorization response uses JARM, which is not supported");
+    }
+    let state = params.state.as_deref().unwrap_or_default();
+    if state.is_empty() {
+        bail!("authorization response carries no `state`");
+    }
+
+    let pending = store
+        .take(state, now)
+        .await?
+        .context("no pending login for that `state` (unknown, expired, or already used)")?;
+
+    if !binding_matches(&pending.browser_binding_hash, presented_cookie) {
+        bail!(
+            "the callback did not present the browser-binding cookie for this login; \
+             refusing to complete a flow this browser did not start"
+        );
+    }
+
+    let code = verify_callback(params, &pending.issuer)?;
+    Ok((pending, code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_auth::AuthMethod;
+    use crate::store::memory::MemoryPendingLogins;
+    use crate::store::{PendingLogin, PendingLoginStore};
 
     const ISSUER: &str = "https://auth.example.com";
 
@@ -704,5 +750,151 @@ mod tests {
         let mut params = ok_params();
         params.state = None;
         assert!(verify_callback(&params, ISSUER).is_err());
+    }
+
+    // ── complete_callback: the three steps as one ────────────────────────────
+
+    async fn pending_db(cookie_hash: &str) -> MemoryPendingLogins {
+        let store = MemoryPendingLogins::new();
+        let pending = PendingLogin {
+            state: "state-value".into(),
+            browser_binding_hash: cookie_hash.into(),
+            pkce_verifier: "verifier".into(),
+            dpop_key_jwk: "{}".into(),
+            issuer: ISSUER.into(),
+            pds_url: "https://pds.example.com".into(),
+            did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
+            auth_method: AuthMethod::PrivateKeyJwt,
+            auth_kid: None,
+            redirect_uri: "https://feather-reader.com/oauth/callback".into(),
+            requested_scope: "atproto".into(),
+            request_uri: "urn:x".into(),
+            app_return_to: None,
+            expires_at: 2_000_000_000,
+        };
+        store.put(&pending).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn complete_callback_returns_the_code_for_the_right_browser() {
+        let cookie = new_binding_token();
+        let store = pending_db(&binding_hash(&cookie)).await;
+        let (pending, code) = complete_callback(&store, &ok_params(), Some(&cookie), 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(code, "the-code");
+        assert_eq!(pending.pkce_verifier, "verifier");
+    }
+
+    /// **The login-CSRF case.** Another browser fetching the callback URL has no
+    /// cookie, so it must not complete the flow -- and the row must be gone, so
+    /// the real browser cannot be raced afterwards either.
+    #[tokio::test]
+    async fn complete_callback_refuses_a_browser_that_did_not_start_the_flow() {
+        let cookie = new_binding_token();
+        for presented in [None, Some(new_binding_token())] {
+            let store = pending_db(&binding_hash(&cookie)).await;
+            assert!(
+                complete_callback(&store, &ok_params(), presented.as_deref(), 1_700_000_000)
+                    .await
+                    .is_err()
+            );
+
+            // Consumed regardless, so a mismatched cookie cannot be retried.
+            assert!(
+                complete_callback(&store, &ok_params(), Some(&cookie), 1_700_000_000)
+                    .await
+                    .is_err(),
+                "the pending row survived a failed binding check"
+            );
+        }
+    }
+
+    /// **The expected issuer comes from the PENDING ROW, not from the callback.**
+    ///
+    /// Every existing test here stores `issuer: ISSUER` and sends
+    /// `iss: Some(ISSUER)` — the same constant on both sides, so none of them
+    /// can tell which one the check actually used. A mutation validating `iss`
+    /// against ITSELF passed all of them, which would defeat RFC 9207 entirely:
+    /// the point of the parameter is to notice that the response came from a
+    /// different authorization server than the one the request was pushed to.
+    #[tokio::test]
+    async fn complete_callback_validates_iss_against_the_stored_issuer() {
+        let cookie = new_binding_token();
+        let store = pending_db(&binding_hash(&cookie)).await;
+
+        // The row was pushed to ISSUER; the callback claims a different one.
+        let impostor = CallbackParams {
+            iss: Some("https://evil.example".into()),
+            ..ok_params()
+        };
+        let err = complete_callback(&store, &impostor, Some(&cookie), 1_700_000_000)
+            .await
+            .expect_err("an `iss` from another authorization server must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("evil.example") || rendered.contains("iss"),
+            "failed for the wrong reason: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_callback_rejects_an_unknown_or_expired_state() {
+        let cookie = new_binding_token();
+        let store = pending_db(&binding_hash(&cookie)).await;
+
+        let mut unknown = ok_params();
+        unknown.state = Some("never-existed".into());
+        assert!(
+            complete_callback(&store, &unknown, Some(&cookie), 1_700_000_000)
+                .await
+                .is_err()
+        );
+
+        // Expired: `now` past the row's expiry.
+        assert!(
+            complete_callback(&store, &ok_params(), Some(&cookie), 2_000_000_001)
+                .await
+                .is_err()
+        );
+    }
+
+    /// The binding is checked BEFORE the code is returned, so a wrong issuer or
+    /// an error response cannot be used to probe with the wrong cookie either.
+    #[tokio::test]
+    async fn complete_callback_checks_the_binding_before_anything_else_about_the_response() {
+        let cookie = new_binding_token();
+        let store = pending_db(&binding_hash(&cookie)).await;
+
+        let mut denied = ok_params();
+        denied.code = None;
+        denied.error = Some("access_denied".into());
+        let rendered = format!(
+            "{:#}",
+            complete_callback(&store, &denied, None, 1_700_000_000)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            rendered.contains("browser-binding"),
+            "reported the response before checking the browser: {rendered}"
+        );
+    }
+
+    /// The callback future is `Send` for any store, so a web framework can run
+    /// it on a multi-threaded runtime. Compile-time.
+    #[test]
+    fn the_callback_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        fn generic<P: PendingLoginStore>(store: &P) {
+            assert_send(&complete_callback(
+                store,
+                &CallbackParams::default(),
+                None,
+                0,
+            ));
+        }
+        generic(&MemoryPendingLogins::new());
     }
 }
