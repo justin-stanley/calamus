@@ -266,6 +266,21 @@ pub async fn send_with_dpop(
     request: &DpopRequest<'_>,
     now: i64,
 ) -> Result<PostOutcome> {
+    let (outcome, _minted_at) =
+        send_with_dpop_at(fetcher, nonces, request, crate::Elapsing::from(now)).await?;
+    Ok(outcome)
+}
+
+/// [`send_with_dpop`] on the caller's own clock, so a nested call does not
+/// re-anchor it. Also returns when the proof that got the final response was
+/// minted (Unix seconds): the earliest the server can have issued anything in
+/// it, which is what an expiry counts from.
+pub(crate) async fn send_with_dpop_at(
+    fetcher: &Fetcher,
+    nonces: &impl NonceStore,
+    request: &DpopRequest<'_>,
+    clock: crate::Elapsing,
+) -> Result<(PostOutcome, i64)> {
     let DpopRequest {
         endpoint,
         url,
@@ -276,18 +291,11 @@ pub async fn send_with_dpop(
     } = *request;
     let method = body.method();
     let origin = origin_of(url)?;
-    let clock = crate::Elapsing::from(now);
     let mut nonce = nonces.get(&origin).await?;
 
     for attempt in 0..2 {
-        let proof = dpop::proof(
-            key,
-            method,
-            url,
-            access_token,
-            nonce.as_deref(),
-            clock.now(),
-        )?;
+        let minted_at = clock.now();
+        let proof = dpop::proof(key, method, url, access_token, nonce.as_deref(), minted_at)?;
         let headers = request_headers(&proof, access_token)?;
 
         let response = match body {
@@ -347,7 +355,7 @@ pub async fn send_with_dpop(
             nonce = Some(fresh);
             continue;
         }
-        return Ok(PostOutcome { status, body });
+        return Ok((PostOutcome { status, body }, minted_at));
     }
     unreachable!("the loop returns on its second pass")
 }

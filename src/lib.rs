@@ -40,22 +40,29 @@ pub fn error_body_worth_parsing(body: &[u8]) -> bool {
 /// carry the time it is MINTED, not the time the call began. So each such
 /// function captures this at entry and reads [`Elapsing::now`] at every mint.
 /// It counts on tokio's clock, which a test can pause and advance.
+///
+/// **Captured once per public call and handed down**, never re-anchored at
+/// [`Elapsing::now`]: that is whole seconds, so each nested call that started
+/// its own count from it dropped up to a second (valid_session, the refresh,
+/// the request: up to ~3 s behind).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Elapsing {
     base: i64,
     start: tokio::time::Instant,
 }
 
-impl Elapsing {
+impl From<i64> for Elapsing {
     /// Start counting from `now`.
-    pub(crate) fn from(now: i64) -> Self {
+    fn from(now: i64) -> Self {
         Self {
             base: now,
             start: tokio::time::Instant::now(),
         }
     }
+}
 
-    /// `now` plus the whole seconds elapsed since [`Elapsing::from`].
+impl Elapsing {
+    /// `now` plus the whole seconds elapsed since the count began.
     pub(crate) fn now(&self) -> i64 {
         let elapsed = i64::try_from(self.start.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.base.saturating_add(elapsed)

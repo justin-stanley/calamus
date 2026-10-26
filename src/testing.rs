@@ -843,6 +843,9 @@ pub mod store_contract {
             did: SUB.into(),
             auth_method: AuthMethod::PrivateKeyJwt,
             auth_kid: Some("client-kid".into()),
+            // Not derivable from the redirect: a store that drops it, or
+            // rebuilds it from another column, fails the round trip.
+            client_id: "https://client-id.example/oauth/client-metadata.json".into(),
             redirect_uri: "https://client.example/oauth/callback".into(),
             requested_scope: "atproto".into(),
             request_uri: "urn:ietf:params:oauth:request_uri:x".into(),
@@ -1028,6 +1031,7 @@ pub mod store_contract {
         tasks: usize,
         rounds: usize,
     ) {
+        assert_multi_thread("pending_take_is_atomic");
         for round in 0..rounds {
             let state = format!("s-atomic-{round}");
             store.put(&pending_login(&state, NOW + 600)).await.unwrap();
@@ -1046,6 +1050,92 @@ pub mod store_contract {
                 winners += usize::from(handle.await.unwrap());
             }
             assert_eq!(winners, 1, "round {round}: {winners} concurrent takes won");
+        }
+    }
+
+    /// A parallelism step on a current-thread runtime passes without testing
+    /// anything: its tasks never overlap.
+    fn assert_multi_thread(step: &str) {
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+            "{step} needs a multi-thread runtime (#[tokio::test(flavor = \"multi_thread\")]); \
+             on a current-thread one it passes vacuously"
+        );
+    }
+
+    /// The conditional writes are atomic under real parallelism: each round
+    /// stores a row, reads its version once, and releases `tasks` spawned
+    /// writers together, all presenting that version. Three races, `rounds`
+    /// rounds each, and exactly one writer wins every round:
+    ///
+    /// * `update_if_unchanged` against `update_if_unchanged` (the winner's
+    ///   session is what is stored);
+    /// * `delete_if_unchanged` against `delete_if_unchanged` (the row is gone);
+    /// * `update_if_unchanged` against `delete_if_unchanged`, half each (the
+    ///   row is the winning update's, or gone if a delete won).
+    ///
+    /// A store that checks the version in one statement (or lock scope) and
+    /// writes in another lets two writers both see the version they read and
+    /// both report success: two refreshes each storing their own rotation, or
+    /// a refresh and a sign-out both "winning", which is a resurrection. Needs
+    /// a multi-threaded runtime; `store` must be empty and is left empty.
+    pub async fn sessions_conditional_writes_are_atomic<S: SessionStore + 'static>(
+        store: std::sync::Arc<S>,
+        tasks: usize,
+        rounds: usize,
+    ) {
+        assert_multi_thread("sessions_conditional_writes_are_atomic");
+        assert!(tasks >= 2, "a race needs at least two writers");
+        for (race, label) in ["update/update", "delete/delete", "update/delete"]
+            .into_iter()
+            .enumerate()
+        {
+            for round in 0..rounds {
+                store.put(&session(SUB, "race-base")).await.unwrap();
+                let (_, version) = store.get_versioned(SUB).await.unwrap().unwrap();
+                let start = std::sync::Arc::new(tokio::sync::Barrier::new(tasks));
+                let handles: Vec<_> = (0..tasks)
+                    .map(|writer| {
+                        let (store, start, version) =
+                            (store.clone(), start.clone(), version.clone());
+                        let update = match race {
+                            0 => true,
+                            1 => false,
+                            _ => writer % 2 == 0,
+                        };
+                        tokio::spawn(async move {
+                            let mine = session(SUB, &format!("race-{writer}"));
+                            start.wait().await;
+                            let won = if update {
+                                store.update_if_unchanged(&mine, &version).await.unwrap()
+                            } else {
+                                store.delete_if_unchanged(SUB, &version).await.unwrap()
+                            };
+                            (won, update.then_some(mine))
+                        })
+                    })
+                    .collect();
+                let mut winners = Vec::new();
+                for handle in handles {
+                    let (won, wrote) = handle.await.unwrap();
+                    if won {
+                        winners.push(wrote);
+                    }
+                }
+                assert_eq!(
+                    winners.len(),
+                    1,
+                    "{label}, round {round}: {} conditional writes on one version won",
+                    winners.len()
+                );
+                let stored = store.get(SUB).await.unwrap();
+                assert_eq!(
+                    stored, winners[0],
+                    "{label}, round {round}: the row is not the winning write's"
+                );
+                store.delete(SUB).await.unwrap();
+            }
         }
     }
 
@@ -1125,5 +1215,71 @@ pub mod store_contract {
             store.take("s-two", NOW).await.unwrap().is_some(),
             "taking one state consumed another"
         );
+    }
+}
+
+/// Stores whose operations move tokio's clock forward, for the tests that pin
+/// WHEN a proof, an assertion or an expiry is minted. The clock is paused only
+/// for the advance and resumed at once, so it never spans network I/O (where
+/// auto-advance would fire reqwest's timeouts).
+#[cfg(test)]
+pub(crate) mod slow {
+    use std::time::Duration;
+
+    use anyhow::Result;
+
+    use crate::store::memory::{MemoryNonces, MemoryPendingLogins};
+    use crate::store::{NonceStore, PendingLogin, PendingLoginStore};
+
+    /// Advance tokio's clock by `by`, without leaving it paused.
+    pub(crate) async fn advance(by: Duration) {
+        if by.is_zero() {
+            return;
+        }
+        tokio::time::pause();
+        tokio::time::advance(by).await;
+        tokio::time::resume();
+    }
+
+    /// [`MemoryNonces`] whose `get` advances the clock by `on_get` and whose
+    /// `put` advances it by `on_put` (after storing).
+    #[derive(Default)]
+    pub(crate) struct SlowNonces {
+        pub(crate) inner: MemoryNonces,
+        pub(crate) on_get: Duration,
+        pub(crate) on_put: Duration,
+    }
+
+    impl NonceStore for SlowNonces {
+        async fn get(&self, origin: &str) -> Result<Option<String>> {
+            let got = self.inner.get(origin).await;
+            advance(self.on_get).await;
+            got
+        }
+
+        async fn put(&self, origin: &str, nonce: &str, now: i64) -> Result<()> {
+            self.inner.put(origin, nonce, now).await?;
+            advance(self.on_put).await;
+            Ok(())
+        }
+    }
+
+    /// [`MemoryPendingLogins`] whose `take` advances the clock by `on_take`.
+    #[derive(Default)]
+    pub(crate) struct SlowPending {
+        pub(crate) inner: MemoryPendingLogins,
+        pub(crate) on_take: Duration,
+    }
+
+    impl PendingLoginStore for SlowPending {
+        async fn put(&self, login: &PendingLogin) -> Result<()> {
+            self.inner.put(login).await
+        }
+
+        async fn take(&self, state: &str, now: i64) -> Result<Option<PendingLogin>> {
+            let taken = self.inner.take(state, now).await;
+            advance(self.on_take).await;
+            taken
+        }
     }
 }

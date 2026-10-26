@@ -81,6 +81,10 @@ pub struct PendingLogin {
     pub auth_method: AuthMethod,
     /// The `kid` of the client key that signed the PAR assertion, if any.
     pub auth_kid: Option<String>,
+    /// The `client_id` PAR was pushed under; the code exchange must present
+    /// the same one. Independent of `redirect_uri` in calamus, so it is stored
+    /// and compared in its own right.
+    pub client_id: String,
     /// The redirect URI pushed in PAR; the code exchange must repeat it.
     pub redirect_uri: String,
     /// The scope requested in PAR.
@@ -168,6 +172,7 @@ impl std::fmt::Debug for PendingLogin {
             .field("did", &self.did)
             .field("auth_method", &self.auth_method)
             .field("auth_kid", &self.auth_kid)
+            .field("client_id", &self.client_id)
             .field("redirect_uri", &self.redirect_uri)
             .field("requested_scope", &self.requested_scope)
             .field("request_uri", &self.request_uri)
@@ -586,6 +591,42 @@ mod tests {
         .await;
     }
 
+    /// The conditional writes stay atomic under real parallelism.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn memory_sessions_conditional_writes_are_atomic_across_threads() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            std::sync::Arc::new(MemorySessions::new()),
+            8,
+            1000,
+        )
+        .await;
+    }
+
+    /// **A parallelism step refuses a current-thread runtime**, where its
+    /// tasks never overlap and it would pass for any store.
+    #[tokio::test]
+    #[should_panic(expected = "multi-thread runtime")]
+    async fn the_parallel_contract_steps_refuse_a_current_thread_runtime() {
+        crate::testing::store_contract::sessions_conditional_writes_are_atomic(
+            std::sync::Arc::new(MemorySessions::new()),
+            2,
+            1,
+        )
+        .await;
+    }
+
+    /// The same for the parallel `take`.
+    #[tokio::test]
+    #[should_panic(expected = "multi-thread runtime")]
+    async fn the_parallel_take_refuses_a_current_thread_runtime() {
+        crate::testing::store_contract::pending_take_is_atomic(
+            std::sync::Arc::new(MemoryPendingLogins::new()),
+            2,
+            1,
+        )
+        .await;
+    }
+
     /// The contract suite against the in-memory pending-login store.
     #[tokio::test]
     async fn memory_pending_logins_meet_the_store_contract() {
@@ -603,6 +644,7 @@ mod tests {
             did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
             auth_method: crate::client_auth::AuthMethod::None,
             auth_kid: None,
+            client_id: "http://localhost".into(),
             redirect_uri: "http://127.0.0.1/callback".into(),
             requested_scope: "atproto".into(),
             request_uri: "urn:x".into(),

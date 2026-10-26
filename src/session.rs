@@ -29,7 +29,7 @@ use crate::client_auth::{self, AuthMethod};
 use crate::dpop::Endpoint;
 use crate::keys::SigningKey;
 use crate::net::Fetcher;
-use crate::request::{send_with_dpop, DpopBody, DpopRequest, Retry};
+use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
 use crate::revoke::{self, Revocation, RevokeContext};
 use crate::store::{NonceStore, Session, SessionStore};
 use crate::token::{self, RefreshFailure, TokenResponse};
@@ -41,6 +41,10 @@ pub use crate::discovery::same_issuer;
 /// Pure, so the rotation rules are testable without a server — which matters,
 /// because every one of them fails as a mysterious logout rather than as an
 /// error anyone can trace.
+///
+/// `now` is what `expires_in` counts from. The refresh passes the time its
+/// request's proof was minted, before the request went out: the server issued
+/// the token no earlier, so the stored expiry can be early, never late.
 pub fn apply_refresh(session: &Session, response: &TokenResponse, now: i64) -> Result<Session> {
     // A refresh must never be able to move a session to another account.
     if response.sub != session.sub {
@@ -90,20 +94,42 @@ pub fn apply_refresh(session: &Session, response: &TokenResponse, now: i64) -> R
 /// concluding the grant is dead, and writes only over the row it read.
 ///
 /// A subject's entry is dropped when its last holder releases it and nobody
-/// waits on it, so the map holds only subjects being refreshed right now.
+/// waits on it (a waiter that is cancelled gives its place back as it is
+/// dropped), so the map holds only subjects being refreshed right now.
 #[derive(Debug, Default, Clone)]
 pub struct RefreshLocks {
     locks: Arc<Mutex<LockMap>>,
 }
 
-type LockMap = HashMap<String, Arc<AsyncMutex<()>>>;
+type LockMap = HashMap<String, LockEntry>;
+
+/// One subject's lock, and how many callers hold or wait on it.
+///
+/// **Counted, not inferred from `Arc::strong_count`.** A waiter's clones live
+/// in its future (the entry and the acquire future's own copy) and are dropped
+/// when that future is, outside the map lock and in an order the compiler
+/// chooses, so a count of references cannot say whether anyone is still
+/// waiting. `users` changes only under the map lock: incremented before a
+/// caller first touches the mutex, decremented after it has released (or
+/// given up waiting). An entry is removed exactly when it reaches 0, so no
+/// one can be holding or waiting on a mutex that has left the map, and the
+/// next caller's fresh mutex can never be held alongside it.
+#[derive(Debug, Default)]
+struct LockEntry {
+    mutex: Arc<AsyncMutex<()>>,
+    users: usize,
+}
 
 /// Holds one subject's refresh lock; releases it when dropped.
+///
+/// Exists from the moment a caller asks for the lock, so a waiter that is
+/// cancelled (its future dropped before the lock was granted) still gives its
+/// place back.
 #[derive(Debug)]
 pub struct RefreshGuard {
-    /// `None` only inside `drop`, which releases it under the map lock.
+    /// `None` while waiting, and inside `drop`, which releases it under the
+    /// map lock.
     guard: Option<OwnedMutexGuard<()>>,
-    entry: Arc<AsyncMutex<()>>,
     locks: Arc<Mutex<LockMap>>,
     sub: String,
 }
@@ -111,18 +137,14 @@ pub struct RefreshGuard {
 impl Drop for RefreshGuard {
     fn drop(&mut self) {
         let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
-        // Release first, under the map lock: a new caller clones the entry only
+        // Release first, under the map lock: a new caller joins an entry only
         // under the map lock, so nothing can start waiting while we decide.
         self.guard = None;
-        // What is left referencing this mutex: the map's copy and ours. Any
-        // more is a waiter (each holds a clone from the moment it asked), which
-        // still needs the entry.
-        if Arc::strong_count(&self.entry) == 2
-            && locks
-                .get(&self.sub)
-                .is_some_and(|in_map| Arc::ptr_eq(in_map, &self.entry))
-        {
-            locks.remove(&self.sub);
+        if let Some(entry) = locks.get_mut(&self.sub) {
+            entry.users -= 1;
+            if entry.users == 0 {
+                locks.remove(&self.sub);
+            }
         }
     }
 }
@@ -136,19 +158,23 @@ impl RefreshLocks {
 
     /// Acquire the lock for one subject. Unrelated subjects never contend.
     pub async fn lock(&self, sub: &str) -> RefreshGuard {
-        let entry = {
+        let mutex = {
             // Recover rather than panic: this gates every token refresh, so a
             // poisoned lock here would lock every user out until a restart.
             let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
-            Arc::clone(locks.entry(sub.to_string()).or_default())
+            let entry = locks.entry(sub.to_string()).or_default();
+            entry.users += 1;
+            Arc::clone(&entry.mutex)
         };
-        let guard = Arc::clone(&entry).lock_owned().await;
-        RefreshGuard {
-            guard: Some(guard),
-            entry,
+        // Built before the wait: if this future is dropped while waiting, the
+        // guard's drop is what gives the place back.
+        let mut held = RefreshGuard {
+            guard: None,
             locks: Arc::clone(&self.locks),
             sub: sub.to_string(),
-        }
+        };
+        held.guard = Some(mutex.lock_owned().await);
+        held
     }
 }
 
@@ -174,6 +200,17 @@ pub struct RefreshContext<'a> {
     /// The authorization server `token_endpoint` and `revocation_endpoint` were
     /// discovered for. A session whose issuer is any other is refused before
     /// anything is sent ([`same_issuer`]).
+    ///
+    /// **Set it to the issuer you ran discovery FOR**, which is usually the
+    /// `issuer` of your own earlier read of this session (the endpoints are not
+    /// stored on it, so you read it, discovered for its issuer, and built this
+    /// context). That is not checking a value against itself: the refresh
+    /// re-reads the row under its lock, and the row it then holds can be a
+    /// different grant from the one you read (a re-login, after a PDS
+    /// migration, at another authorization server). The check compares the
+    /// issuer your ENDPOINTS belong to with the issuer of the row whose refresh
+    /// token is about to be sent, so the token never goes to a server that
+    /// did not issue it.
     pub issuer: &'a str,
 }
 
@@ -204,7 +241,7 @@ pub async fn valid_session(
 
     let _guard = locks.lock(sub).await;
     // The wait can be long (another refresh's whole round trip): from here on
-    // the time is the time after it.
+    // the time is the time after it, on the same clock (never re-anchored).
     let now = clock.now();
 
     // Re-read AFTER acquiring the lock: whoever held it may have refreshed while
@@ -217,7 +254,7 @@ pub async fn valid_session(
         return Ok(session);
     }
 
-    refresh_locked(store, fetcher, nonces, &session, &version, ctx, now).await
+    refresh_locked(store, fetcher, nonces, &session, &version, ctx, clock).await
 }
 
 /// A refresh succeeded at the server, but the row it started from is no longer
@@ -240,11 +277,11 @@ async fn lost_the_row(
     nonces: &impl NonceStore,
     ctx: &RefreshContext<'_>,
     obtained: &Session,
-    now: i64,
+    clock: crate::Elapsing,
 ) -> Result<Session> {
     let current = store.get(&obtained.sub).await?;
     let outcome =
-        revoke::revoke_orphaned(fetcher, nonces, &orphan_context(ctx), obtained, now).await;
+        revoke::revoke_orphaned_at(fetcher, nonces, &orphan_context(ctx), obtained, clock).await;
     if let Revocation::Failed(reason) = &outcome {
         tracing::warn!(
             sub = %obtained.sub,
@@ -282,10 +319,25 @@ fn orphan_context<'a>(ctx: &RefreshContext<'a>) -> RevokeContext<'a> {
 }
 
 /// The tokens a 2xx refresh response carried, as a session to revoke, when the
-/// response could not be applied (it did not parse as a token response, or its
-/// `sub` is another account's). `None` when it names no token at all: a body
-/// that is not JSON, or JSON without either token, leaves nothing to revoke.
-fn unapplied_tokens(session: &Session, body: &serde_json::Value) -> Option<Session> {
+/// response could not be applied: it did not parse as a token response
+/// (`parsed` false), or it parsed and its `sub` is another account's.
+///
+/// `None` (revoke nothing) when:
+///
+/// * it names no token: a body that is not JSON, or JSON without either token;
+/// * **it names the STORED session's own tokens.** A refused response echoing
+///   `session.refresh_token` (or `access_token`) is about the stored grant,
+///   which is still live and still ours: revoking it would sign the user out
+///   over a response that changed nothing. And when the refresh token it names
+///   is the stored one, its access token belongs to the same grant, and
+///   revoking an access token may end the whole grant (RFC 7009 §2.1), so
+///   nothing is revoked at all. No token equal to either stored token is ever
+///   sent;
+/// * **it did not parse and names no NEW refresh token.** An unparseable body
+///   is not evidence of a new grant; only a refresh token distinct from the
+///   stored one is.
+fn unapplied_tokens(session: &Session, body: &serde_json::Value, parsed: bool) -> Option<Session> {
+    let stored = |t: &str| t == session.refresh_token || t == session.access_token;
     let field = |name: &str| {
         body.get(name)
             .and_then(serde_json::Value::as_str)
@@ -293,6 +345,13 @@ fn unapplied_tokens(session: &Session, body: &serde_json::Value) -> Option<Sessi
             .map(str::to_string)
     };
     let (access, refresh) = (field("access_token"), field("refresh_token"));
+    if refresh.as_deref().is_some_and(stored) {
+        return None;
+    }
+    if !parsed && refresh.is_none() {
+        return None;
+    }
+    let access = access.filter(|t| !stored(t));
     if access.is_none() && refresh.is_none() {
         return None;
     }
@@ -312,9 +371,8 @@ async fn refresh_locked<S: SessionStore>(
     session: &Session,
     version: &S::Version,
     ctx: &RefreshContext<'_>,
-    now: i64,
+    clock: crate::Elapsing,
 ) -> Result<Session> {
-    let clock = crate::Elapsing::from(now);
     // Before anything else: this sends the REFRESH TOKEN.
     same_issuer(ctx.issuer, &session.issuer)?;
     let key = SigningKey::from_jwk_json(&session.dpop_key_jwk, "session-dpop")?;
@@ -342,7 +400,7 @@ async fn refresh_locked<S: SessionStore>(
     )?);
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let outcome = send_with_dpop(
+    let (outcome, minted_at) = send_with_dpop_at(
         fetcher,
         nonces,
         &DpopRequest {
@@ -355,7 +413,7 @@ async fn refresh_locked<S: SessionStore>(
             // exchange, a rejected attempt consumes nothing.
             retry: Retry::Allowed,
         },
-        clock.now(),
+        clock,
     )
     .await?;
     client_auth::log_evidence(
@@ -368,21 +426,25 @@ async fn refresh_locked<S: SessionStore>(
     if outcome.is_success() {
         // A body that is not JSON names no token: nothing to revoke.
         let body = outcome.json()?;
-        let applied = token::parse_token_response(&body)
-            .and_then(|response| apply_refresh(session, &response, clock.now()));
+        let parsed = token::parse_token_response(&body);
+        let was_parsed = parsed.is_ok();
+        // The expiry counts from when the proof was minted, before the request
+        // went out: the server issued the token no earlier than that, so this
+        // errs early (a refresh a little soon), never late (a stale token).
+        let applied = parsed.and_then(|response| apply_refresh(session, &response, minted_at));
         let updated = match applied {
             Ok(updated) => updated,
             Err(err) => {
                 // The server issued tokens we will not store (another account's
                 // `sub`, or a malformed response): revoke them rather than leave
                 // them live, under the session's key they were issued to.
-                if let Some(unapplied) = unapplied_tokens(session, &body) {
-                    let outcome = revoke::revoke_orphaned(
+                if let Some(unapplied) = unapplied_tokens(session, &body, was_parsed) {
+                    let outcome = revoke::revoke_orphaned_at(
                         fetcher,
                         nonces,
                         &orphan_context(ctx),
                         &unapplied,
-                        clock.now(),
+                        clock,
                     )
                     .await;
                     if let Revocation::Failed(reason) = &outcome {
@@ -404,7 +466,7 @@ async fn refresh_locked<S: SessionStore>(
         // session with these fresh tokens, after it had been reported signed
         // out.
         if !store.update_if_unchanged(&updated, version).await? {
-            return lost_the_row(store, fetcher, nonces, ctx, &updated, clock.now()).await;
+            return lost_the_row(store, fetcher, nonces, ctx, &updated, clock).await;
         }
         // Logged because a refresh is otherwise INVISIBLE: it rotates both
         // tokens and is the one path that can silently end a session, but it
@@ -774,7 +836,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await;
 
@@ -821,7 +883,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("a concurrent rotation is not an error");
@@ -863,7 +925,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("refresh");
@@ -906,7 +968,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect_err("a refresh for another subject must fail");
@@ -950,7 +1012,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect_err("not a token response");
@@ -959,6 +1021,139 @@ mod tests {
             revoke_requests(&log).is_empty(),
             "{:#?}",
             revoke_requests(&log)
+        );
+    }
+
+    /// **A refused 2xx that echoes the stored refresh token revokes nothing.**
+    /// The parser refuses `token_type: "Bearer"`, but the body names
+    /// `old-refresh`, the STORED session's live token: revoking it would sign
+    /// the user out over a response that changed nothing.
+    #[tokio::test]
+    async fn an_unparseable_refresh_response_echoing_the_stored_token_revokes_nothing() {
+        let echo = TestResponse::json(
+            200,
+            serde_json::json!({
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "token_type": "Bearer",
+                "scope": "atproto",
+                "sub": DID,
+                "expires_in": 3600,
+            })
+            .to_string(),
+        );
+        let (fetcher, base, log) = token_server_answering(echo).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        let err = refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await
+        .expect_err("a Bearer response is refused");
+        assert!(format!("{err:#}").contains("DPoP"), "{err:#}");
+        assert_eq!(token_requests(&log).len(), 1);
+        assert!(
+            revoke_requests(&log).is_empty(),
+            "revoked the stored session's own token: {:#?}",
+            revoke_requests(&log)
+        );
+        assert_eq!(store.get(DID).await.unwrap(), Some(session));
+    }
+
+    /// The same for a response that parses but names another `sub` while
+    /// echoing the stored refresh token: the token is the stored grant's, so
+    /// nothing is revoked and the session is kept.
+    #[tokio::test]
+    async fn a_moved_sub_echoing_the_stored_refresh_token_revokes_nothing() {
+        let echo = TestResponse::json(
+            200,
+            serde_json::json!({
+                "access_token": "other-access",
+                "refresh_token": "old-refresh",
+                "token_type": "DPoP",
+                "scope": "atproto",
+                "sub": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                "expires_in": 3600,
+            })
+            .to_string(),
+        );
+        let (fetcher, base, log) = token_server_answering(echo).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        refresh_locked(
+            &store,
+            &fetcher,
+            &MemoryNonces::new(),
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await
+        .expect_err("another subject is refused");
+        assert!(
+            revoke_requests(&log).is_empty(),
+            "revoked a token of the stored grant: {:#?}",
+            revoke_requests(&log)
+        );
+        assert_eq!(store.get(DID).await.unwrap(), Some(session));
+    }
+
+    /// Which tokens of an unapplied 2xx are revoked, rule by rule: never one
+    /// equal to a stored token, nothing when the refresh token is the stored
+    /// one, and nothing for an unparseable body without a NEW refresh token.
+    #[test]
+    fn unapplied_tokens_never_name_the_stored_grant() {
+        let stored = session();
+        let revoked = |body: serde_json::Value, parsed: bool| {
+            unapplied_tokens(&stored, &body, parsed).map(|s| (s.access_token, s.refresh_token))
+        };
+        let pair = |a: &str, r: &str| Some((a.to_string(), r.to_string()));
+
+        // A new grant's tokens, parsed or not, are revoked.
+        let both = serde_json::json!({"access_token": "a2", "refresh_token": "r2"});
+        assert_eq!(revoked(both.clone(), true), pair("a2", "r2"));
+        assert_eq!(revoked(both, false), pair("a2", "r2"));
+        // The stored refresh token (or the stored access token in its place)
+        // echoed: the stored grant's; nothing.
+        for echo in ["old-refresh", "old-access"] {
+            let body = serde_json::json!({"access_token": "a2", "refresh_token": echo});
+            assert_eq!(revoked(body.clone(), true), None, "{echo}");
+            assert_eq!(revoked(body, false), None, "{echo}");
+        }
+        // A new refresh token beside the stored access token: the refresh
+        // token only.
+        let body = serde_json::json!({"access_token": "old-access", "refresh_token": "r2"});
+        assert_eq!(revoked(body, true), pair("", "r2"));
+        // No refresh token: an access token alone is revoked only from a
+        // response that parsed, and never the stored one.
+        assert_eq!(
+            revoked(serde_json::json!({"access_token": "a2"}), true),
+            pair("a2", "")
+        );
+        assert_eq!(
+            revoked(serde_json::json!({"access_token": "a2"}), false),
+            None
+        );
+        assert_eq!(
+            revoked(serde_json::json!({"access_token": "old-access"}), true),
+            None
+        );
+        assert_eq!(
+            revoked(serde_json::json!({"access_token": "old-refresh"}), true),
+            None
+        );
+        // Nothing named, nothing revoked.
+        assert_eq!(revoked(serde_json::json!({}), true), None);
+        assert_eq!(
+            revoked(serde_json::json!({"access_token": ""}), false),
+            None
         );
     }
 
@@ -980,7 +1175,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect_err("a dead grant is an error");
@@ -1002,7 +1197,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect_err("a 5xx is an error for this request");
@@ -1045,7 +1240,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("a stale token rejected after another process rotated is not a dead grant");
@@ -1132,7 +1327,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("the re-login is a live session");
@@ -1164,7 +1359,7 @@ mod tests {
             &session,
             &version,
             &ctx(&token, &revoke),
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("the refresh answers the challenge");
@@ -1216,7 +1411,7 @@ mod tests {
             &session,
             &version,
             &ctx,
-            NOW,
+            NOW.into(),
         )
         .await
         .expect("refresh");
@@ -1251,7 +1446,7 @@ mod tests {
             &session,
             &version,
             &ctx,
-            NOW,
+            NOW.into(),
         )
         .await
         .expect_err("another issuer's endpoint must be refused");
@@ -1309,6 +1504,76 @@ mod tests {
         );
     }
 
+    /// **One clock from the entry to the proof.** Each nested call used to
+    /// re-anchor at the whole seconds its caller had counted, dropping up to
+    /// a second per level: 0.6 s of lock wait, then 0.6 s reading the nonce,
+    /// is 1.2 s, but the proof said 0 s (valid_session, refresh_locked and
+    /// send_with_dpop each restarting from a truncated second).
+    #[tokio::test]
+    async fn a_proof_after_nested_waits_counts_every_fraction_once() {
+        let (fetcher, base, log) = token_server().await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, _, _) = stored_stale().await;
+        let locks = RefreshLocks::default();
+        let nonces = crate::testing::slow::SlowNonces {
+            on_get: std::time::Duration::from_millis(600),
+            ..Default::default()
+        };
+        let ctx = ctx(&token, &revoke);
+
+        tokio::time::pause();
+        let held = locks.lock(DID).await;
+        let waiting = valid_session(&store, &fetcher, &nonces, &locks, DID, &ctx, NOW);
+        tokio::pin!(waiting);
+        assert!(futures_lite_poll_pending(&mut waiting));
+        tokio::time::advance(std::time::Duration::from_millis(600)).await;
+        drop(held);
+        tokio::time::resume();
+
+        waiting.await.expect("refresh");
+        let reqs = token_requests(&log);
+        let iat = proof_claims(&reqs[0])["iat"].as_i64().unwrap();
+        assert!(
+            (NOW + 1..NOW + 3).contains(&iat),
+            "1.2 s after the entry, the proof carried iat {iat} (NOW{:+})",
+            iat - NOW
+        );
+    }
+
+    /// **The refreshed expiry counts from when the proof was minted**, before
+    /// the request went out, not from after the response: the server's
+    /// `expires_in` runs from when it issued the token, which is no earlier
+    /// than the proof. Here the response offers a fresh nonce whose store
+    /// takes 60 s, after the response and before the expiry is computed.
+    #[tokio::test]
+    async fn a_refreshed_expiry_counts_from_the_proofs_mint_time() {
+        let (fetcher, base, _log) =
+            token_server_answering(rotation().with_header("DPoP-Nonce", "after")).await;
+        let (token, revoke) = (format!("{base}/token"), format!("{base}/revoke"));
+        let (store, session, version) = stored_stale().await;
+        let nonces = crate::testing::slow::SlowNonces {
+            on_put: std::time::Duration::from_secs(60),
+            ..Default::default()
+        };
+        let got = refresh_locked(
+            &store,
+            &fetcher,
+            &nonces,
+            &session,
+            &version,
+            &ctx(&token, &revoke),
+            NOW.into(),
+        )
+        .await
+        .expect("refresh");
+        let expires_at = got.expires_at.unwrap();
+        assert!(
+            (NOW + 3600..NOW + 3603).contains(&expires_at),
+            "the expiry was anchored after the response: NOW+3600{:+}",
+            expires_at - NOW - 3600
+        );
+    }
+
     /// **The refresh locks forget a subject once nothing holds or waits on
     /// it.** One entry per subject ever refreshed, kept forever, is a slow
     /// leak on a long-running server with many accounts.
@@ -1335,6 +1600,97 @@ mod tests {
         assert_eq!(locks.entries(), 50);
         drop(guards);
         assert_eq!(locks.entries(), 0);
+    }
+
+    /// **A waiter that is cancelled leaves no entry behind.** A refresh whose
+    /// future is dropped while it waits for the lock (its request was
+    /// cancelled, a `select!` lost) held a clone of the subject's entry; the
+    /// holder's release saw that clone and kept the entry for it, and the
+    /// waiter's drop then left it in the map for good.
+    #[tokio::test]
+    async fn a_cancelled_waiter_leaves_no_lock_entry() {
+        let locks = RefreshLocks::default();
+
+        // Released while the waiter waits, then the waiter is cancelled.
+        let held = locks.lock(DID).await;
+        {
+            let waiter = locks.lock(DID);
+            tokio::pin!(waiter);
+            assert!(futures_lite_poll_pending(&mut waiter));
+            drop(held);
+        }
+        assert_eq!(locks.entries(), 0, "a cancelled waiter's entry was kept");
+
+        // Cancelled while the holder still holds, then released.
+        let held = locks.lock(DID).await;
+        {
+            let waiter = locks.lock(DID);
+            tokio::pin!(waiter);
+            assert!(futures_lite_poll_pending(&mut waiter));
+        }
+        assert_eq!(locks.entries(), 1, "the holder still needs its entry");
+        drop(held);
+        assert_eq!(locks.entries(), 0);
+
+        // The subject still locks and serializes afterwards.
+        let held = locks.lock(DID).await;
+        let second = locks.lock(DID);
+        tokio::pin!(second);
+        assert!(futures_lite_poll_pending(&mut second));
+        drop(held);
+        drop(second.await);
+        assert_eq!(locks.entries(), 0);
+    }
+
+    /// **Never two holders of one subject, and nothing left behind**, under
+    /// real parallelism: 16 tasks x 2000 lock/yield/unlock rounds on 8
+    /// workers over two subjects, every fifth attempt cancelled if it does not
+    /// get the lock at once. Removing an entry while anyone holds or waits on
+    /// it would let the next caller create a second mutex for the subject.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn refresh_locks_never_admit_two_holders_and_end_empty() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const SUBS: [&str; 2] = [DID, "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"];
+        let locks = RefreshLocks::default();
+        let holding: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let overlapped = Arc::new(AtomicBool::new(false));
+
+        let tasks: Vec<_> = (0..16)
+            .map(|task| {
+                let (locks, holding, overlapped) =
+                    (locks.clone(), holding.clone(), overlapped.clone());
+                tokio::spawn(async move {
+                    for i in 0..2000usize {
+                        let which = (task + i) % 2;
+                        let guard = if i % 5 == 0 {
+                            // Cancelled unless the lock is free on the first poll.
+                            tokio::select! {
+                                biased;
+                                guard = locks.lock(SUBS[which]) => Some(guard),
+                                () = tokio::task::yield_now() => None,
+                            }
+                        } else {
+                            Some(locks.lock(SUBS[which]).await)
+                        };
+                        let Some(guard) = guard else { continue };
+                        if holding[which].fetch_add(1, Ordering::SeqCst) != 0 {
+                            overlapped.store(true, Ordering::SeqCst);
+                        }
+                        tokio::task::yield_now().await;
+                        holding[which].fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "two holders held one subject's lock at once"
+        );
+        assert_eq!(locks.entries(), 0, "lock entries were left behind");
     }
 
     async fn futures_join_all(locks: &RefreshLocks, n: usize) -> Vec<RefreshGuard> {

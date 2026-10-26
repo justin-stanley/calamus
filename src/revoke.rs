@@ -26,7 +26,7 @@ use crate::client_auth::{self, AuthMethod};
 use crate::dpop::Endpoint;
 use crate::keys::SigningKey;
 use crate::net::Fetcher;
-use crate::request::{send_with_dpop, DpopBody, DpopRequest, Retry};
+use crate::request::{send_with_dpop_at, DpopBody, DpopRequest, Retry};
 #[cfg(feature = "revoke")]
 use crate::store::SessionStore;
 use crate::store::{NonceStore, Session};
@@ -40,7 +40,9 @@ pub enum Revocation {
     Revoked,
     /// There was no session to revoke — logout is idempotent.
     NoSession,
-    /// The attempt failed. The local row is gone regardless.
+    /// The attempt failed. The local row is gone regardless, except where
+    /// `sign_out` says it is left: a row that kept rotating, or one at another
+    /// authorization server than the endpoint's.
     Failed(String),
 }
 
@@ -112,6 +114,14 @@ pub struct RevokeContext<'a> {
     /// ([`crate::discovery::same_issuer`]): another server answers 200 for a
     /// token it does not know, so the grant stays live while this reports it
     /// revoked, and its refresh token has been handed to that server.
+    ///
+    /// **Set it to the issuer you ran discovery FOR**, usually the `issuer` of
+    /// your own earlier read of the session. It is not compared with itself:
+    /// `sign_out` reads the row again (and again, if a refresh rotates it),
+    /// and the row it ends up revoking can be a different grant at another
+    /// authorization server (a re-login after a PDS migration). The check ties
+    /// the endpoint to the grant actually being sent there; such a row is left
+    /// for a sign-out that discovers its own issuer.
     pub issuer: &'a str,
 }
 
@@ -128,9 +138,20 @@ pub async fn revoke_orphaned(
     session: &Session,
     now: i64,
 ) -> Revocation {
+    revoke_orphaned_at(fetcher, nonces, ctx, session, crate::Elapsing::from(now)).await
+}
+
+/// [`revoke_orphaned`] on the caller's clock.
+pub(crate) async fn revoke_orphaned_at(
+    fetcher: &Fetcher,
+    nonces: &impl NonceStore,
+    ctx: &RevokeContext<'_>,
+    session: &Session,
+    clock: crate::Elapsing,
+) -> Revocation {
     match tokio::time::timeout(
         ctx.deadline,
-        revoke_tokens(fetcher, nonces, ctx, session, now),
+        revoke_tokens_at(fetcher, nonces, ctx, session, clock),
     )
     .await
     {
@@ -151,7 +172,18 @@ pub async fn revoke_tokens(
     session: &Session,
     now: i64,
 ) -> Revocation {
-    match try_revoke(fetcher, nonces, ctx, session, now).await {
+    revoke_tokens_at(fetcher, nonces, ctx, session, crate::Elapsing::from(now)).await
+}
+
+/// [`revoke_tokens`] on the caller's clock.
+pub(crate) async fn revoke_tokens_at(
+    fetcher: &Fetcher,
+    nonces: &impl NonceStore,
+    ctx: &RevokeContext<'_>,
+    session: &Session,
+    clock: crate::Elapsing,
+) -> Revocation {
+    match try_revoke_at(fetcher, nonces, ctx, session, clock).await {
         Ok(()) => Revocation::Revoked,
         Err(err) => Revocation::Failed(format!("{err:#}")),
     }
@@ -171,7 +203,17 @@ pub async fn try_revoke(
     session: &Session,
     now: i64,
 ) -> Result<()> {
-    let clock = crate::Elapsing::from(now);
+    try_revoke_at(fetcher, nonces, ctx, session, crate::Elapsing::from(now)).await
+}
+
+/// [`try_revoke`] on the caller's clock: a nested call does not re-anchor it.
+pub(crate) async fn try_revoke_at(
+    fetcher: &Fetcher,
+    nonces: &impl NonceStore,
+    ctx: &RevokeContext<'_>,
+    session: &Session,
+    clock: crate::Elapsing,
+) -> Result<()> {
     // Before anything else: this sends the REFRESH TOKEN.
     crate::discovery::same_issuer(ctx.issuer, &session.issuer)?;
     let endpoint = ctx.revocation_endpoint.ok_or_else(|| {
@@ -199,7 +241,7 @@ pub async fn try_revoke(
     // The session's own DPoP key, as for every other call on this grant: the
     // reference routes revocation through the same `dpopFetch`.
     let key = SigningKey::from_jwk_json(&session.dpop_key_jwk, "session")?;
-    let outcome = send_with_dpop(
+    let (outcome, _) = send_with_dpop_at(
         fetcher,
         nonces,
         &DpopRequest {
@@ -210,7 +252,7 @@ pub async fn try_revoke(
             body: DpopBody::Form(&form),
             retry: Retry::Allowed,
         },
-        clock.now(),
+        clock,
     )
     .await?;
     // Every response, not just failures: a 2xx here is the evidence that
@@ -246,12 +288,15 @@ pub async fn try_revoke(
 /// Past the deadline the attempt is abandoned and the local session goes.
 ///
 /// `ctx.revocation_endpoint` must be the one discovered for `ctx.issuer`. A row
-/// re-read after a change can belong to another issuer (a re-login after a PDS
-/// migration): its tokens are then NOT sent to this endpoint; that attempt
-/// fails, and the row is deleted like any other whose revocation failed. A
-/// caller that discovers the endpoint per session (it is not stored on the
-/// session) uses [`sign_out_with`] and discovers inside the attempt, for the
-/// row each attempt actually read.
+/// read (or re-read after a change) that belongs to another issuer (a re-login
+/// after a PDS migration) is a live grant this endpoint cannot end: its tokens
+/// are NOT sent here, and the row is NOT deleted. Deleting it would drop a live
+/// token unrevoked with no record left to retry from, which is the same reason
+/// a row that keeps rotating is left in place. The outcome is
+/// [`Revocation::Failed`], naming the issuer; a sign-out that discovers THAT
+/// row's issuer can finish it. A caller that discovers the endpoint per session
+/// (it is not stored on the session) uses [`sign_out_with`] and discovers
+/// inside the attempt, for the row each attempt actually read.
 #[cfg(feature = "revoke")]
 pub async fn sign_out(
     store: &impl SessionStore,
@@ -264,9 +309,22 @@ pub async fn sign_out(
     // Each attempt revokes at ITS time: up to three of them, each bounded by
     // the deadline, so the last can start well after `now`.
     let clock = crate::Elapsing::from(now);
-    sign_out_with(store, sub, ctx.deadline, |session| async move {
-        revoke_tokens(fetcher, nonces, ctx, &session, clock.now()).await
-    })
+    sign_out_checked(
+        store,
+        sub,
+        ctx.deadline,
+        |session| {
+            crate::discovery::same_issuer(ctx.issuer, &session.issuer)
+                .err()
+                .map(|err| {
+                    Revocation::Failed(format!(
+                        "{err:#}; the session was left in place for a sign-out at its own \
+                         authorization server"
+                    ))
+                })
+        },
+        |session| async move { revoke_tokens_at(fetcher, nonces, ctx, &session, clock).await },
+    )
     .await
 }
 
@@ -284,10 +342,30 @@ pub async fn sign_out_with<S, F, Fut>(
     store: &S,
     sub: &str,
     deadline: std::time::Duration,
+    revoke: F,
+) -> Revocation
+where
+    S: SessionStore,
+    F: FnMut(Session) -> Fut,
+    Fut: std::future::Future<Output = Revocation>,
+{
+    sign_out_checked(store, sub, deadline, |_| None, revoke).await
+}
+
+/// [`sign_out_with`], with `refuse` asked about each row read before anything
+/// is sent for it: `Some(outcome)` ends the sign-out with that outcome, the
+/// row neither revoked nor deleted.
+#[cfg(feature = "revoke")]
+async fn sign_out_checked<S, R, F, Fut>(
+    store: &S,
+    sub: &str,
+    deadline: std::time::Duration,
+    refuse: R,
     mut revoke: F,
 ) -> Revocation
 where
     S: SessionStore,
+    R: Fn(&Session) -> Option<Revocation>,
     F: FnMut(Session) -> Fut,
     Fut: std::future::Future<Output = Revocation>,
 {
@@ -308,6 +386,9 @@ where
                 return Revocation::Failed(format!("reading the session: {err:#}"));
             }
         };
+        if let Some(refused) = refuse(&session) {
+            return refused;
+        }
 
         match bounded_then_delete(store, sub, &version, deadline, revoke(session)).await {
             Attempt::Done(outcome) => return outcome,
@@ -1228,6 +1309,99 @@ mod tests {
                 }
                 other => panic!("the moved grant was not revoked, so not Revoked: {other:?}"),
             }
+            // And the re-login is LEFT, not deleted unrevoked: its grant is
+            // live at its own authorization server, and a sign-out that
+            // discovers that server is the one that can end it.
+            let left = store.inner.get(DID).await.unwrap();
+            assert_eq!(
+                left.as_ref().map(|s| s.refresh_token.as_str()),
+                Some("refresh-moved"),
+                "the other issuer's re-login was deleted without being revoked"
+            );
+        }
+
+        /// A [`MemorySessions`] whose `get_versioned` advances tokio's clock
+        /// by `by` after reading.
+        struct SlowRead {
+            inner: MemorySessions,
+            by: std::time::Duration,
+        }
+
+        impl SessionStore for SlowRead {
+            type Version = <MemorySessions as SessionStore>::Version;
+
+            async fn get(&self, sub: &str) -> anyhow::Result<Option<Session>> {
+                self.inner.get(sub).await
+            }
+            async fn get_versioned(
+                &self,
+                sub: &str,
+            ) -> anyhow::Result<Option<(Session, Self::Version)>> {
+                let read = self.inner.get_versioned(sub).await;
+                crate::testing::slow::advance(self.by).await;
+                read
+            }
+            async fn put(&self, session: &Session) -> anyhow::Result<()> {
+                self.inner.put(session).await
+            }
+            async fn update_if_unchanged(
+                &self,
+                session: &Session,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                self.inner.update_if_unchanged(session, version).await
+            }
+            async fn delete(&self, sub: &str) -> anyhow::Result<bool> {
+                self.inner.delete(sub).await
+            }
+            async fn delete_if_unchanged(
+                &self,
+                sub: &str,
+                version: &Self::Version,
+            ) -> anyhow::Result<bool> {
+                self.inner.delete_if_unchanged(sub, version).await
+            }
+        }
+
+        /// **One clock from the sign-out to the proof.** 0.6 s reading the
+        /// row and 0.6 s reading the nonce is 1.2 s; re-anchoring at each
+        /// level (sign_out, try_revoke, send_with_dpop) at truncated seconds
+        /// made the proof say 0 s.
+        #[tokio::test]
+        async fn a_sign_out_proof_counts_every_fraction_once() {
+            let (fetcher, endpoint, log) =
+                super::revocation_server(crate::testing::TestResponse::json(200, "{}")).await;
+            let store = SlowRead {
+                inner: MemorySessions::new(),
+                by: std::time::Duration::from_millis(600),
+            };
+            stored(&store.inner).await;
+            let nonces = crate::testing::slow::SlowNonces {
+                on_get: std::time::Duration::from_millis(600),
+                ..Default::default()
+            };
+
+            let outcome = sign_out(
+                &store,
+                &fetcher,
+                &nonces,
+                &RevokeContext {
+                    deadline: std::time::Duration::from_secs(5),
+                    ..ctx(Some(&endpoint))
+                },
+                DID,
+                NOW,
+            )
+            .await;
+            assert_eq!(outcome, Revocation::Revoked);
+            let revokes = super::revoke_requests(&log);
+            let proof = super::dpop_proof(&revokes[0]);
+            let iat = super::jwt_part(&proof, 1)["iat"].as_i64().unwrap();
+            assert!(
+                (NOW + 1..NOW + 3).contains(&iat),
+                "1.2 s after the entry, the proof carried iat NOW{:+}",
+                iat - NOW
+            );
         }
 
         /// The sign-out future is `Send` for any stores. Compile-time.

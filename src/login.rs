@@ -187,7 +187,7 @@ impl Client {
                     .await
             },
             |req: ParPost| async move {
-                post_form(fetcher, nonces, &req.url, &req.key, &req.params, req.retry, req.now)
+                post_form(fetcher, nonces, &req.url, &req.key, &req.params, req.retry, req.clock)
                     .await
             },
         )
@@ -249,7 +249,7 @@ impl Client {
                 .await
             },
             |req: TokenPost| async move {
-                post_form(fetcher, nonces, &req.url, &req.key, &req.params, req.retry, req.now)
+                post_form(fetcher, nonces, &req.url, &req.key, &req.params, req.retry, req.clock)
                     .await
             },
             |did: String| async move {
@@ -343,8 +343,9 @@ struct ParPost {
     /// the token endpoint with a binding error nothing explains.
     key: Arc<SigningKey>,
     retry: Retry,
-    /// The time the request is sent at, for its DPoP proof.
-    now: i64,
+    /// The login's clock, for the request's DPoP proofs: the transport mints
+    /// on it rather than re-anchoring at a truncated second.
+    clock: crate::Elapsing,
 }
 
 /// [`Client::start`] with its three network boundaries injected.
@@ -443,7 +444,7 @@ where
         key: Arc::clone(&session_key),
         // PAR is safe to repeat: a rejected attempt consumes nothing.
         retry: Retry::Allowed,
-        now: clock.now(),
+        clock,
     })
     .await?;
     client_auth::log_evidence(
@@ -468,6 +469,7 @@ where
             did: account.did.clone(),
             auth_method: client.auth_method,
             auth_kid: client.key.as_ref().map(|k| k.kid().to_string()),
+            client_id: client.client_id.clone(),
             redirect_uri: redirect_uri.to_string(),
             requested_scope: scope.to_string(),
             request_uri: par.request_uri.clone(),
@@ -507,8 +509,8 @@ struct TokenPost {
     /// thumbprint it was never bound to — with a green suite.
     key: Arc<SigningKey>,
     retry: Retry,
-    /// The time the request is sent at, for its DPoP proof.
-    now: i64,
+    /// The login's clock, for the request's DPoP proofs.
+    clock: crate::Elapsing,
 }
 
 /// [`Client::complete`] with the three network boundaries injected.
@@ -571,12 +573,14 @@ where
     // the logs would explain.
     let auth_method = pending.auth_method;
 
-    // The client's IDENTITY must also be the one PAR was pushed under. The
-    // stored redirect detects a configuration change between the push and the
-    // callback (in FeatherReader both it and `client_id` derive from one public
-    // URL). Without this the exchange fails at the authorization server with a
-    // mismatched client, and nothing on our side says why. Checked here so the
-    // reason is in the log rather than inferred from a 400.
+    // The client's IDENTITY must also be the one PAR was pushed under: both
+    // its `client_id` and its redirect, which in calamus are independent (in
+    // FeatherReader both derive from one public URL, so the redirect alone
+    // said it). Without this the exchange presents the code, the PKCE verifier
+    // and an assertion as a client the grant was never issued to; it fails at
+    // the authorization server, and nothing on our side says why. Checked
+    // here, before discovery and any POST, so the reason is in the log rather
+    // than inferred from a 400.
     let current_redirect = client.metadata.redirect_uri();
     if current_redirect != pending.redirect_uri {
         bail!(
@@ -584,6 +588,17 @@ where
              the client identity changed mid-flight and the exchange would be rejected",
             pending.redirect_uri,
             current_redirect
+        );
+    }
+
+    // After the redirect: when both changed (a new public URL), the redirect
+    // names the configuration change most directly.
+    if client.client_id != pending.client_id {
+        bail!(
+            "this login was started under a different client_id ({:?}, now {:?}); the \
+             client identity changed mid-flight and the exchange would be rejected",
+            pending.client_id,
+            client.client_id
         );
     }
 
@@ -622,7 +637,7 @@ where
         // harvested at PAR is routinely stale by now — approval can take minutes
         // and a server nonce lasts at most five.
         retry: Retry::Allowed,
-        now: clock.now(),
+        clock,
     })
     .await?;
     client_auth::log_evidence(
@@ -785,10 +800,10 @@ async fn post_form(
     key: &SigningKey,
     params: &[(&'static str, String)],
     retry: Retry,
-    now: i64,
+    clock: crate::Elapsing,
 ) -> Result<PostOutcome> {
     let borrowed: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    request::send_with_dpop(
+    let (outcome, _) = request::send_with_dpop_at(
         fetcher,
         nonces,
         &request::DpopRequest {
@@ -799,9 +814,10 @@ async fn post_form(
             body: request::DpopBody::Form(&borrowed),
             retry,
         },
-        now,
+        clock,
     )
-    .await
+    .await?;
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1111,6 +1127,7 @@ mod tests {
             did: PENDING_DID.into(),
             auth_method: AuthMethod::PrivateKeyJwt,
             auth_kid: None,
+            client_id: "https://feather-reader.com/oauth/client-metadata.json".into(),
             redirect_uri: PUSHED_REDIRECT.into(),
             requested_scope: "atproto transition:generic".into(),
             request_uri: "urn:x".into(),
@@ -3192,6 +3209,171 @@ mod tests {
             Some(NOW + 120 + 3600),
             "the session's expiry counts from when the token response arrived"
         );
+    }
+
+    /// **One clock from the callback to the token proof.** 0.6 s taking the
+    /// pending row and 0.6 s reading the nonce is 1.2 s; re-anchoring in the
+    /// transport at the truncated second made the proof say 0 s. Driven
+    /// through [`Client::complete`] over real TLS, so the production adapter
+    /// is what carries the clock.
+    #[tokio::test]
+    async fn a_token_proof_after_nested_waits_counts_every_fraction_once() {
+        let cookie = flow::new_binding_token();
+        let (addr, log) = spawn_tls(|addr| {
+            let port = addr.port();
+            let mut r = discovery_routes(
+                &format!("https://pds-e2e.test:{port}"),
+                &format!("https://as-e2e.test:{port}"),
+            );
+            r.insert(
+                "/token".to_string(),
+                vec![TestResponse::json(200, token_body(PENDING_DID).to_string())],
+            );
+            r
+        })
+        .await;
+        let fetcher = Fetcher::default();
+        for h in ["pds-e2e.test", "as-e2e.test"] {
+            test_host_override(&fetcher, h, addr);
+        }
+        let port = addr.port();
+        let issuer = format!("https://as-e2e.test:{port}");
+        let mut pending = pending_auth(&flow::binding_hash(&cookie));
+        pending.pds_url = format!("https://pds-e2e.test:{port}");
+        pending.issuer = issuer.clone();
+        let slow_pending = crate::testing::slow::SlowPending {
+            on_take: std::time::Duration::from_millis(600),
+            ..Default::default()
+        };
+        slow_pending.inner.put(&pending).await.unwrap();
+        let nonces = crate::testing::slow::SlowNonces {
+            on_get: std::time::Duration::from_millis(600),
+            ..Default::default()
+        };
+        let sessions = MemorySessions::new();
+        let dns = StaticDns::new();
+        let deps = Deps {
+            fetcher: &fetcher,
+            dns: &dns,
+            pending: &slow_pending,
+            sessions: &sessions,
+            nonces: &nonces,
+        };
+        let mut params = callback_params();
+        params.iss = Some(issuer);
+
+        client_at("https://feather-reader.com")
+            .complete(&deps, &params, Some(&cookie), NOW)
+            .await
+            .expect("the login completes");
+
+        let token_req = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.starts_with("POST /token"))
+            .cloned()
+            .expect("the token endpoint was never reached");
+        let iat = claims_of(&dpop_proof(&token_req))["iat"].as_i64().unwrap();
+        assert!(
+            (NOW + 1..NOW + 3).contains(&iat),
+            "1.2 s after the entry, the token proof carried iat NOW{:+}",
+            iat - NOW
+        );
+    }
+
+    /// Two confidential clients with ONE redirect and different `client_id`s:
+    /// the redirect comparison cannot tell them apart.
+    fn client_with_id(client_id: &str) -> Client {
+        let at = |u: &str| url::Url::parse(u).unwrap();
+        let metadata = ClientMetadata::confidential(
+            at(client_id),
+            vec![at("https://app.example.com/oauth/callback")],
+            "atproto transition:generic",
+            "App",
+            None,
+            Jwks::Uri(at("https://app.example.com/oauth/jwks.json")),
+        )
+        .unwrap();
+        Client::new(
+            metadata,
+            Some(SigningKey::generate("k")),
+            "https://plc.invalid",
+        )
+        .unwrap()
+    }
+
+    /// **A login is completed only under the `client_id` it was started
+    /// under.** In calamus the `client_id` and the redirect are independent
+    /// (FeatherReader derives both from one public URL), so comparing the
+    /// redirect alone let a pending login pushed as one client be redeemed as
+    /// another: the code, the PKCE verifier and an assertion for the second
+    /// client all posted to the token endpoint, which rejects them for a
+    /// reason nothing here explains. Refused before discovery or any POST.
+    #[tokio::test]
+    async fn a_login_completed_under_another_client_id_posts_nothing() {
+        let started_as = client_with_id("https://app.example.com/oauth/client-metadata.json");
+        let completed_as = client_with_id("https://app.example.com/oauth/other-metadata.json");
+
+        for (completer, refused) in [(&completed_as, true), (&started_as, false)] {
+            let stores = empty_stores().await;
+            let (started, pushed) = run_start(&started_as, &stores, NOW).await;
+            let started = started.expect("the start succeeds");
+            let params = flow::CallbackParams {
+                code: Some("the-code".into()),
+                state: Some(pushed_state(&pushed)),
+                iss: Some(START_ISSUER.into()),
+                ..Default::default()
+            };
+            let posts = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let discoveries = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+            let (p, d) = (posts.clone(), discoveries.clone());
+            let out = complete_with(
+                completer,
+                &stores.pending,
+                &stores.sessions,
+                &params,
+                Some(&started.binding_token),
+                NOW,
+                move |_req| {
+                    *d.lock().unwrap() += 1;
+                    async move { Ok(started_server()) }
+                },
+                move |_req: TokenPost| {
+                    *p.lock().unwrap() += 1;
+                    async move { Ok(outcome(400, &serde_json::json!({"error": "invalid_grant"}))) }
+                },
+                |_did| async move { Err(anyhow::anyhow!("offline")) },
+            )
+            .await;
+            let err = format!("{:#}", out.expect_err("the stub exchange fails either way"));
+            if refused {
+                assert!(
+                    err.contains("client_id"),
+                    "refused, but not BY the client_id check: {err}"
+                );
+                assert_eq!(
+                    *posts.lock().unwrap(),
+                    0,
+                    "posted to the token endpoint as another client"
+                );
+                assert_eq!(
+                    *discoveries.lock().unwrap(),
+                    0,
+                    "discovered before refusing"
+                );
+            } else {
+                assert!(
+                    !err.contains("client_id"),
+                    "the same client was refused: {err}"
+                );
+                assert_eq!(
+                    *posts.lock().unwrap(),
+                    1,
+                    "the same client never reached the token endpoint"
+                );
+            }
+        }
     }
 
     // ── the Client itself ─────────────────────────────────────────────────────

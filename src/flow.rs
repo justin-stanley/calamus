@@ -783,6 +783,7 @@ mod tests {
             did: "did:plc:ewvi7nxzyoun6zhxrhs64oiz".into(),
             auth_method: AuthMethod::PrivateKeyJwt,
             auth_kid: None,
+            client_id: "https://feather-reader.com/oauth/client-metadata.json".into(),
             redirect_uri: "https://feather-reader.com/oauth/callback".into(),
             requested_scope: "atproto".into(),
             request_uri: "urn:x".into(),
