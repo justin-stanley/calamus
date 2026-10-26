@@ -34,3 +34,6 @@ pub fn error_body_worth_parsing(body: &[u8]) -> bool {
 pub mod client_auth;
 pub mod flow;
 pub mod metadata;
+pub mod net;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
