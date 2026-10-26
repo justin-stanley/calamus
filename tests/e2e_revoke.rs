@@ -60,7 +60,7 @@ async fn sign_out_with_no_revocation_endpoint_still_deletes() {
     w.fake.advertise_revocation(false);
     let login = w.login().await;
     let server = w.discover_for(&login.session).await.unwrap();
-    assert_eq!(server.revocation_endpoint, None);
+    assert_eq!(server.revocation_endpoint(), None);
     let ctx = context(&w, &server, REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
@@ -116,8 +116,8 @@ async fn a_sign_out_whose_first_read_is_another_issuers_row_sends_nothing_and_le
     )
     .await
     .expect("the moved server's own metadata is consistent");
-    assert_ne!(moved.issuer, login.session.issuer, "precondition");
-    assert!(moved.revocation_endpoint.is_some(), "precondition");
+    assert_ne!(moved.issuer(), login.session.issuer, "precondition");
+    assert!(moved.revocation_endpoint().is_some(), "precondition");
     let ctx = context(&w, &moved, REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;
@@ -158,11 +158,8 @@ async fn a_revoke_context_from_a_discovery_at_another_issuer_sends_nothing() {
     .await
     .unwrap();
     let ctx = RevokeContext::new(&moved, &w.client);
-    assert_eq!(ctx.issuer(), moved.issuer);
-    assert_eq!(
-        ctx.revocation_endpoint(),
-        moved.revocation_endpoint.as_deref()
-    );
+    assert_eq!(ctx.issuer(), moved.issuer());
+    assert_eq!(ctx.revocation_endpoint(), moved.revocation_endpoint());
     assert_eq!(ctx.deadline(), REVOKE_DEADLINE);
 
     let outcome = sign_out(&w.sessions, &w.fetcher, &w.nonces, &ctx, &login.did, NOW).await;

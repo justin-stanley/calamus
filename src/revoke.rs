@@ -60,11 +60,17 @@ pub enum Revocation {
     /// * **the store's delete failed** (reason "deleting the local session:
     ///   ...", then what the revocation did), or the row could not be read
     ///   and the delete after it failed too (reason "reading the session: ...;
-    ///   deleting it also failed: ...", nothing revoked).
+    ///   deleting it also failed: ...", nothing revoked);
+    /// * from `sign_out_with` or `sign_out_checked`, the injected revocation
+    ///   (or `refuse`) itself returned `LeftInPlace`: the row is not deleted.
     ///
     /// Deleting in the first two cases would drop a live grant with no record
-    /// left to revoke it from; in the last the store did not let us. **The
-    /// user is still signed in.** The caller must read the
+    /// left to revoke it from; in the third the store did not let us. **The
+    /// row is still on record**, and the user is still signed in unless the
+    /// revocation succeeded: after a delete failure where the tokens WERE
+    /// revoked, the row holds revoked tokens, and the next refresh ends it with
+    /// `invalid_grant` (the access token stops working at once on a server that
+    /// revokes the whole grant). Otherwise the caller must read the
     /// row again, discover ITS issuer, and sign out again with that context
     /// (or revoke at that issuer); reporting the user signed out without doing
     /// so leaves them signed in.
@@ -197,12 +203,12 @@ impl<'a> RevokeContext<'a> {
         client_key: Option<&'a SigningKey>,
     ) -> Self {
         Self {
-            revocation_endpoint: server.revocation_endpoint.as_deref(),
+            revocation_endpoint: server.revocation_endpoint(),
             client_id,
             auth_method,
             client_key,
             deadline: REVOKE_DEADLINE,
-            issuer: &server.issuer,
+            issuer: server.issuer(),
         }
     }
 
@@ -449,6 +455,10 @@ pub async fn sign_out(
 /// [`Revocation::LeftInPlace`]. A row that cannot be read is deleted anyway
 /// ([`Revocation::Failed`]). Whenever the row may still exist because the
 /// store's delete failed, the outcome is [`Revocation::LeftInPlace`].
+///
+/// **A `revoke` that returns [`Revocation::LeftInPlace`] leaves the row**: it
+/// is treated as a refusal and nothing is deleted. To refuse a row before
+/// anything is sent for it, use [`sign_out_checked`].
 #[cfg(feature = "revoke")]
 pub async fn sign_out_with<S, F, Fut>(
     store: &S,
@@ -467,9 +477,53 @@ where
 /// [`sign_out_with`], with `refuse` asked about each row read before anything
 /// is sent for it, on the FIRST read and on every re-read: `Some(outcome)`
 /// ends the sign-out with that outcome (a [`Revocation::LeftInPlace`]), the
-/// row neither revoked nor deleted.
+/// row neither revoked nor deleted. [`sign_out`] refuses another issuer's row
+/// this way.
+///
+/// For a caller that injects its revocation and can decide from the row alone
+/// (its `issuer`, say) that it must not be signed out here. A decision only the
+/// attempt can make (after discovering the row's issuer) is reported by
+/// returning [`Revocation::LeftInPlace`] from `revoke`, which also leaves the
+/// row.
+///
+/// ```
+/// use calamus::revoke::{sign_out_checked, Revocation};
+/// use calamus::store::memory::MemorySessions;
+/// use calamus::store::{Session, SessionStore};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let store = MemorySessions::new();
+/// let did = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+/// # store.put(&Session {
+/// #     sub: did.into(),
+/// #     issuer: "https://elsewhere.example".into(),
+/// #     aud: "https://pds.example".into(),
+/// #     dpop_key_jwk: "{}".into(),
+/// #     access_token: "a".into(),
+/// #     refresh_token: "r".into(),
+/// #     token_type: "DPoP".into(),
+/// #     granted_scope: "atproto".into(),
+/// #     expires_at: None,
+/// # }).await.unwrap();
+/// let ours = "https://as.example";
+/// let outcome = sign_out_checked(
+///     &store,
+///     did,
+///     std::time::Duration::from_secs(5),
+///     |row| {
+///         (row.issuer != ours)
+///             .then(|| Revocation::LeftInPlace(format!("{} is another server's", row.issuer)))
+///     },
+///     |_row| async { unreachable!("refused before anything is sent") },
+/// )
+/// .await;
+/// assert!(matches!(outcome, Revocation::LeftInPlace(_)));
+/// assert!(store.get(did).await.unwrap().is_some(), "the row is left");
+/// # }
+/// ```
 #[cfg(feature = "revoke")]
-async fn sign_out_checked<S, R, F, Fut>(
+pub async fn sign_out_checked<S, R, F, Fut>(
     store: &S,
     sub: &str,
     deadline: std::time::Duration,
@@ -538,8 +592,9 @@ const MAX_SIGN_OUT_ATTEMPTS: usize = 3;
 #[cfg(feature = "revoke")]
 #[derive(Debug)]
 enum Attempt {
-    /// The row that was revoked has been deleted (or the delete failed, which
-    /// is reported in the outcome). Final.
+    /// The row that was revoked has been deleted (or the delete failed, or the
+    /// attempt reported `LeftInPlace` and nothing was deleted; both are said in
+    /// the outcome). Final.
     Done(Revocation),
     /// The row was rewritten or removed after it was read, so the revoked token
     /// was not the one on record. Nothing was deleted.
@@ -578,8 +633,16 @@ where
         )),
     };
 
-    // Unconditional on the OUTCOME — the user asked to be logged out — but
-    // conditional on the row being the one whose tokens were just revoked.
+    // An attempt that says the row must stay (another issuer's grant, found
+    // only once the attempt discovered it) is a refusal: deleting it would drop
+    // a live grant unrevoked, and then reporting LeftInPlace would be false.
+    if matches!(outcome, Revocation::LeftInPlace(_)) {
+        return Attempt::Done(outcome);
+    }
+
+    // Otherwise unconditional on the OUTCOME — the user asked to be logged
+    // out — but conditional on the row being the one whose tokens were just
+    // revoked.
     match store.delete_if_unchanged(sub, version).await {
         Ok(true) => Attempt::Done(outcome),
         Ok(false) => Attempt::Changed(outcome),
@@ -1350,6 +1413,48 @@ mod tests {
             .await;
             assert!(matches!(outcome, Revocation::Failed(_)), "{outcome:?}");
             assert!(store.inner.get(DID).await.unwrap().is_none());
+        }
+
+        /// **An attempt that reports `LeftInPlace` leaves the row.** The closure
+        /// decided the row must stay (it discovered the row's issuer and found
+        /// another server, say); deleting it anyway and then reporting
+        /// `LeftInPlace` would say the opposite of what happened.
+        #[tokio::test]
+        async fn an_attempt_reporting_left_in_place_leaves_the_row() {
+            let store = MemorySessions::new();
+            let session = stored(&store).await;
+            let outcome = sign_out_with(&store, DID, TEST_DEADLINE, |_| async {
+                Revocation::LeftInPlace("another authorization server".into())
+            })
+            .await;
+            assert_eq!(
+                outcome,
+                Revocation::LeftInPlace("another authorization server".into())
+            );
+            assert_eq!(store.get(DID).await.unwrap(), Some(session));
+        }
+
+        /// **`sign_out_checked`'s `refuse` ends the sign-out before anything is
+        /// sent or deleted**, for a caller that injects its revocation.
+        #[tokio::test]
+        async fn a_refusal_sends_nothing_and_leaves_the_row() {
+            let store = MemorySessions::new();
+            let session = stored(&store).await;
+            let called = std::sync::atomic::AtomicBool::new(false);
+            let outcome = sign_out_checked(
+                &store,
+                DID,
+                TEST_DEADLINE,
+                |_| Some(Revocation::LeftInPlace("refused".into())),
+                |_| {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async { Revocation::Revoked }
+                },
+            )
+            .await;
+            assert_eq!(outcome, Revocation::LeftInPlace("refused".into()));
+            assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(store.get(DID).await.unwrap(), Some(session));
         }
 
         /// Logging out twice is not an error. The second call has nothing to revoke

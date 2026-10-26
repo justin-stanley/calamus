@@ -42,22 +42,22 @@ async fn discovery_round_trips_against_a_live_pds() -> anyhow::Result<()> {
 
     let server = discover(&http, &account.pds_url, "private_key_jwt", None).await?;
     println!("discovery:");
-    println!("  issuer:        {}", server.issuer);
-    println!("  par:           {}", server.par_endpoint);
-    println!("  authorization: {}", server.authorization_endpoint);
-    println!("  token:         {}", server.token_endpoint);
+    println!("  issuer:        {}", server.issuer());
+    println!("  par:           {}", server.par_endpoint());
+    println!("  authorization: {}", server.authorization_endpoint());
+    println!("  token:         {}", server.token_endpoint());
     println!(
         "  revocation:    {}",
-        server.revocation_endpoint.as_deref().unwrap_or("(absent)")
+        server.revocation_endpoint().unwrap_or("(absent)")
     );
 
     // A real server must satisfy the mix-up defences, not just parse.
     assert!(
-        server.issuer.starts_with("https://"),
+        server.issuer().starts_with("https://"),
         "issuer must be https"
     );
     assert!(
-        !server.par_endpoint.is_empty() && !server.token_endpoint.is_empty(),
+        !server.par_endpoint().is_empty() && !server.token_endpoint().is_empty(),
         "a PDS must advertise PAR and token endpoints"
     );
     // Re-running with the issuer we just learned must be accepted — this is
@@ -66,10 +66,10 @@ async fn discovery_round_trips_against_a_live_pds() -> anyhow::Result<()> {
         &http,
         &account.pds_url,
         "private_key_jwt",
-        Some(&server.issuer),
+        Some(server.issuer()),
     )
     .await?;
-    assert_eq!(again.issuer, server.issuer);
+    assert_eq!(again.issuer(), server.issuer());
 
     // And an impostor issuer must be REFUSED. This is the mix-up defence
     // running against real metadata rather than a fixture.
@@ -98,8 +98,8 @@ async fn discovery_round_trips_against_a_live_pds() -> anyhow::Result<()> {
     println!("  mix-up defence: refused a mismatched issuer, by `same_issuer`");
 
     // Revocation support is what decides whether logout can tell the PDS.
-    match server.revocation_endpoint {
-        Some(ref r) => println!("\n  => this PDS SUPPORTS RFC 7009 revocation at {r}"),
+    match server.revocation_endpoint() {
+        Some(r) => println!("\n  => this PDS SUPPORTS RFC 7009 revocation at {r}"),
         None => println!("\n  => this PDS advertises NO revocation endpoint"),
     }
     Ok(())

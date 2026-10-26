@@ -26,9 +26,15 @@
 //! context), and FeatherReader adds `.context(...)` to calamus's errors and
 //! already finds typed causes with `err.chain().find_map(downcast_ref)`. Keeping
 //! `anyhow` means no signature changes, no adapter at any call site, and
-//! `{err:#}` unchanged by construction; a caller that wants a concrete error type
-//! converts with `Error::from(anyhow::Error)`, which recovers the variant (or
-//! keeps the whole error, context and all, as [`Error::Other`]).
+//! `{err:#}` unchanged by construction.
+//!
+//! **Use [`Error::find`].** A caller that wants a concrete error type can
+//! convert with `Error::from(anyhow::Error)`, but that yields the variant only
+//! when nothing wraps it, and calamus itself wraps resolution, discovery and
+//! fetch errors in context: most errors from the public API convert to
+//! [`Error::Other`] (context and all). On a converted error, ask
+//! [`Error::decision`], which looks inside `Other` for the decision, and
+//! [`Error::invalidates_session`], which does the same.
 //!
 //! **Typed leaves that predate this** stay as they are, and are found the same
 //! way (`err.chain().find_map(|c| c.downcast_ref::<T>())`):
@@ -182,9 +188,11 @@ pub enum Error {
     #[error(transparent)]
     Revoke(#[from] RevokeError),
 
-    /// Anything else: an error with no decision behind it, kept whole (its
-    /// context and chain), from `Error::from(anyhow::Error)`. Calamus itself
-    /// never puts one in an `anyhow::Error`.
+    /// An `anyhow::Error` converted with `Error::from` that is not a calamus
+    /// error with nothing above it, kept whole (its context and chain): either
+    /// no decision at all, or a decision under context (which
+    /// [`Error::decision`] finds). Calamus itself never puts one in an
+    /// `anyhow::Error`.
     #[error(transparent)]
     Other(anyhow::Error),
 }
@@ -195,15 +203,33 @@ impl Error {
         err.chain().find_map(|cause| cause.downcast_ref::<Error>())
     }
 
+    /// The decision this error carries: `self` for a typed variant; for
+    /// [`Error::Other`], the outermost calamus error inside it (what
+    /// [`Error::find`] finds in the wrapped chain), or `None` when there is
+    /// none. Never an `Other`.
+    ///
+    /// `Error::from` keeps a calamus error under context as `Other` (so its
+    /// text is unchanged), and calamus wraps many of its own errors in context;
+    /// this is how a converted error is still branched on.
+    pub fn decision(&self) -> Option<&Error> {
+        match self {
+            Error::Other(err) => Error::find(err).and_then(Error::decision),
+            typed => Some(typed),
+        }
+    }
+
     /// Whether this means the session is gone and the user must log in again:
-    /// a refresh rejected as `invalid_grant`, or no session at all.
+    /// a refresh rejected as `invalid_grant`, or no session at all. Looks
+    /// through [`Error::Other`] (see [`Error::decision`]).
     pub fn invalidates_session(&self) -> bool {
         matches!(
-            self,
-            Error::Refresh {
-                failure: RefreshFailure::SessionInvalid,
-                ..
-            } | Error::NoSession { .. }
+            self.decision(),
+            Some(
+                Error::Refresh {
+                    failure: RefreshFailure::SessionInvalid,
+                    ..
+                } | Error::NoSession { .. }
+            )
         )
     }
 }
@@ -212,7 +238,8 @@ impl From<anyhow::Error> for Error {
     /// The variant, when `err` IS a calamus error with nothing above it;
     /// otherwise [`Error::Other`], keeping its context and chain (whose `Display`
     /// and `{:#}` are then exactly `err`'s). A calamus error under context is
-    /// `Other` (still found inside it with [`Error::find`]): `downcast` alone
+    /// `Other` (still found inside it with [`Error::find`], and through the
+    /// result with [`Error::decision`]): `downcast` alone
     /// would see through `.context(...)` and drop those layers.
     fn from(err: anyhow::Error) -> Self {
         // The outermost cause is the error itself, or the outermost context.
@@ -306,13 +333,14 @@ pub enum ResolutionError {
 #[non_exhaustive]
 pub enum NoDidReason {
     /// No `_atproto` TXT record, and `/.well-known/atproto-did` answered a
-    /// `4xx` (a `404`: nothing is served for that handle).
+    /// `4xx` (a `404`: nothing is served for that handle). Not `403` (a bot
+    /// challenge), `408` or `429` (transient): those stay untyped errors.
     #[error("{url} returned status {status}")]
     #[non_exhaustive]
     WellKnownStatus {
         /// The well-known URL.
         url: String,
-        /// Its status (`400..500`).
+        /// Its status (`400..500`, never `403`, `408` or `429`).
         status: u16,
     },
     /// The `_atproto` TXT record's `did=` value is not a DID.

@@ -289,12 +289,9 @@ async fn a_context_from_a_discovery_at_another_issuer_refuses_before_any_request
     .await
     .expect("the moved server's own metadata is consistent");
     let ctx = calamus::session::RefreshContext::new(&moved, &w.client);
-    assert_eq!(ctx.issuer(), moved.issuer);
-    assert_eq!(ctx.token_endpoint(), moved.token_endpoint);
-    assert_eq!(
-        ctx.revocation_endpoint(),
-        moved.revocation_endpoint.as_deref()
-    );
+    assert_eq!(ctx.issuer(), moved.issuer());
+    assert_eq!(ctx.token_endpoint(), moved.token_endpoint());
+    assert_eq!(ctx.revocation_endpoint(), moved.revocation_endpoint());
 
     let err = valid_session(
         &w.sessions,
@@ -313,7 +310,7 @@ async fn a_context_from_a_discovery_at_another_issuer_refuses_before_any_request
             expected,
             ..
         })) => {
-            assert_eq!(discovered, &moved.issuer);
+            assert_eq!(discovered, moved.issuer());
             assert_eq!(expected, &login.session.issuer);
         }
         other => panic!("{other:?}: {err:#}"),

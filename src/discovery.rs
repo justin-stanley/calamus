@@ -30,22 +30,112 @@ use crate::net::Fetcher;
 const ES256: &str = "ES256";
 
 /// The endpoints a validated authorization server offers.
+///
+/// **Constructible only by discovery** ([`discover`], [`discover_with`],
+/// [`resolve_documents`]), which enforce that the issuer is the URL the metadata
+/// was fetched from and that every endpoint is on the issuer's origin. The
+/// fields are private and the type is `#[non_exhaustive]` because a
+/// [`RefreshContext`](crate::session::RefreshContext) or
+/// [`RevokeContext`](crate::revoke::RevokeContext) trusts the pairing of
+/// [`issuer`](Self::issuer) with its endpoints: with public fields,
+/// `AuthorizationServer { issuer: row.issuer.clone(), ..moved }` paired a
+/// stored grant's issuer with whatever server a repointed PDS named, passed the
+/// issuer check, and sent the refresh token there.
+///
+/// There is deliberately no constructor from stored data. A caller that wants
+/// to avoid re-discovery caches the whole value (it is `Clone`) as discovery
+/// returned it, never the strings it was built from. Tests build one with
+/// `calamus::testing::authorization_server` (feature `test-util`).
+///
+/// A struct literal does not compile outside the crate:
+///
+/// ```compile_fail
+/// let _ = calamus::discovery::AuthorizationServer {
+///     issuer: "https://as.example".into(),
+///     par_endpoint: "https://as.example/par".into(),
+///     authorization_endpoint: "https://as.example/authorize".into(),
+///     token_endpoint: "https://other.example/token".into(),
+///     revocation_endpoint: None,
+/// };
+/// ```
+///
+/// Nor does the struct-update form that re-labels another server's endpoints:
+///
+/// ```compile_fail
+/// fn forge(
+///     moved: calamus::discovery::AuthorizationServer,
+/// ) -> calamus::discovery::AuthorizationServer {
+///     calamus::discovery::AuthorizationServer {
+///         issuer: "https://as.example".into(),
+///         ..moved
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AuthorizationServer {
+    issuer: String,
+    par_endpoint: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    revocation_endpoint: Option<String>,
+}
+
+impl AuthorizationServer {
     /// The issuer: canonical (see [`validate_issuer_form`]), and the URL the
     /// metadata was fetched from.
-    pub issuer: String,
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
     /// `pushed_authorization_request_endpoint`, on the issuer's origin.
-    pub par_endpoint: String,
+    pub fn par_endpoint(&self) -> &str {
+        &self.par_endpoint
+    }
+
     /// `authorization_endpoint`, on the issuer's origin.
-    pub authorization_endpoint: String,
+    pub fn authorization_endpoint(&self) -> &str {
+        &self.authorization_endpoint
+    }
+
     /// `token_endpoint`, on the issuer's origin.
-    pub token_endpoint: String,
+    pub fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
+    }
+
     /// RFC 7009 revocation. **Optional** — RFC 8414 does not require it, and a
     /// server without one simply cannot be told about a sign-out. Absent rather
     /// than an error, because refusing to log a user in over a missing LOGOUT
     /// endpoint would be the wrong trade.
-    pub revocation_endpoint: Option<String>,
+    pub fn revocation_endpoint(&self) -> Option<&str> {
+        self.revocation_endpoint.as_deref()
+    }
+
+    /// Any pairing, unchecked: for `crate::testing` and unit tests only.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn unchecked(
+        issuer: String,
+        par_endpoint: String,
+        authorization_endpoint: String,
+        token_endpoint: String,
+        revocation_endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            issuer,
+            par_endpoint,
+            authorization_endpoint,
+            token_endpoint,
+            revocation_endpoint,
+        }
+    }
+
+    /// `self` with its revocation endpoint replaced, unchecked: for
+    /// `crate::testing` and unit tests only.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn set_revocation_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.revocation_endpoint = endpoint;
+        self
+    }
 }
 
 /// Resolve a PDS to its authorization server, both fetches and both validations.

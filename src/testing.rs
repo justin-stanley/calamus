@@ -33,6 +33,40 @@ use crate::net::Fetcher;
 
 pub mod fake;
 
+/// An [`AuthorizationServer`](crate::discovery::AuthorizationServer) with any
+/// issuer and endpoints, **unchecked**: none of discovery's validations (issuer
+/// equals the fetched-from URL, endpoints on the issuer's origin) are applied.
+///
+/// Test-only on purpose. Outside `test-util` the type is constructible only by
+/// discovery, because a context trusts the pairing of its issuer with its
+/// endpoints; production code caches a discovered value rather than rebuilding
+/// one.
+pub fn authorization_server(
+    issuer: &str,
+    par_endpoint: &str,
+    authorization_endpoint: &str,
+    token_endpoint: &str,
+    revocation_endpoint: Option<&str>,
+) -> crate::discovery::AuthorizationServer {
+    crate::discovery::AuthorizationServer::unchecked(
+        issuer.to_string(),
+        par_endpoint.to_string(),
+        authorization_endpoint.to_string(),
+        token_endpoint.to_string(),
+        revocation_endpoint.map(str::to_string),
+    )
+}
+
+/// `server` with its revocation endpoint replaced by `endpoint`, **unchecked**
+/// (it may be on any origin, or absent). Test-only, as
+/// [`authorization_server`] is.
+pub fn with_revocation_endpoint(
+    server: crate::discovery::AuthorizationServer,
+    endpoint: Option<&str>,
+) -> crate::discovery::AuthorizationServer {
+    server.set_revocation_endpoint(endpoint.map(str::to_string))
+}
+
 /// Point `host` at `addr` for `fetcher`, bypassing DNS **and** the forbidden-IP
 /// check for that host only, and make `fetcher` trust the test CA
 /// ([`test_pki`]).
@@ -1153,7 +1187,10 @@ pub mod store_contract {
     /// as the loss**: e.g. Postgres `40001` ("could not serialize access due
     /// to concurrent update") from a version-guarded `UPDATE`/`DELETE` under
     /// `REPEATABLE READ`, which is raised exactly because the row was changed
-    /// by a committed transaction. **A lock or busy timeout (SQLite
+    /// by a committed transaction. **Under `SERIALIZABLE`, `40001` proves
+    /// nothing**: SSI raises it for read/write dependencies too, including a
+    /// false positive for a row nobody changed, so retry the transaction or
+    /// return it as an error. **A lock or busy timeout (SQLite
     /// `SQLITE_BUSY`, `database is locked`, a Postgres lock timeout or
     /// deadlock) proves nothing** about the row: retry it inside the store,
     /// or return it as an error. Reporting it as `Ok(false)` tells the
@@ -1169,10 +1206,13 @@ pub mod store_contract {
             Err(err) => panic!(
                 "{step}: {call} returned an error under contention ({err:#}). A call that \
                  loses the race must report {lost}, not an error. Map a failure to the loss \
-                 ONLY when it proves another writer committed (e.g. Postgres 40001 from a \
-                 version-guarded UPDATE); a lock or busy timeout (SQLITE_BUSY) proves \
-                 nothing and must be retried inside the store (or, outside a race, returned \
-                 as an error), never reported as {lost}"
+                 ONLY when it proves another writer committed (e.g. Postgres 40001 \
+                 \"could not serialize access due to concurrent update\" from a \
+                 version-guarded UPDATE under REPEATABLE READ; under SERIALIZABLE, SSI's \
+                 40001 can be a false positive and must be retried or returned as an \
+                 error); a lock or busy timeout (SQLITE_BUSY) proves nothing and must be \
+                 retried inside the store (or, outside a race, returned as an error), never \
+                 reported as {lost}"
             ),
         }
     }

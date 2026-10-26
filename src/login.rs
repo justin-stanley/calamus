@@ -431,7 +431,7 @@ where
         code_challenge: &flow::pkce_challenge(&verifier),
         login_hint: Some(subject),
     });
-    let assertion = client_assertion(client, client.auth_method, &server.issuer, clock.now())?;
+    let assertion = client_assertion(client, client.auth_method, server.issuer(), clock.now())?;
     params.extend(client_auth::credential_params(
         client.auth_method,
         &client.client_id,
@@ -446,7 +446,7 @@ where
     // for one, while the pending row below still stores from the same value.
     let session_key = Arc::new(session_key);
     let outcome = push(ParPost {
-        url: server.par_endpoint.clone(),
+        url: server.par_endpoint().to_string(),
         params,
         key: Arc::clone(&session_key),
         // PAR is safe to repeat: a rejected attempt consumes nothing.
@@ -460,7 +460,7 @@ where
             method: sent_method,
             assertion_type: sent_type.as_deref(),
         },
-        &server.par_endpoint,
+        server.par_endpoint(),
         outcome.status,
     );
     let par = accept_par_response(&outcome)?;
@@ -471,7 +471,7 @@ where
             browser_binding_hash: flow::binding_hash(&binding_token),
             pkce_verifier: verifier,
             dpop_key_jwk: session_key.to_jwk_json()?,
-            issuer: server.issuer.clone(),
+            issuer: server.issuer().to_string(),
             pds_url: account.pds_url.clone(),
             did: account.did.clone(),
             auth_method: client.auth_method,
@@ -487,7 +487,7 @@ where
 
     Ok(StartedLogin {
         authorize_url: flow::authorize_url(
-            &server.authorization_endpoint,
+            server.authorization_endpoint(),
             &client.client_id,
             &par.request_uri,
         )?,
@@ -637,7 +637,7 @@ where
     };
 
     let (outcome, minted_at) = post(TokenPost {
-        url: server.token_endpoint.clone(),
+        url: server.token_endpoint().to_string(),
         params: token_params,
         key: Arc::clone(&key),
         // A nonce challenge is rejected BEFORE the grant is processed, so the
@@ -654,7 +654,7 @@ where
             method: sent_method,
             assertion_type: sent_type.as_deref(),
         },
-        &server.token_endpoint,
+        server.token_endpoint(),
         outcome.status,
     );
 
@@ -1273,13 +1273,13 @@ mod tests {
     }
 
     fn started_server() -> AuthorizationServer {
-        AuthorizationServer {
-            issuer: START_ISSUER.into(),
-            par_endpoint: format!("{START_ISSUER}/par"),
-            authorization_endpoint: format!("{START_ISSUER}/authorize"),
-            token_endpoint: format!("{START_ISSUER}/token"),
-            revocation_endpoint: None,
-        }
+        crate::testing::authorization_server(
+            START_ISSUER,
+            &format!("{START_ISSUER}/par"),
+            &format!("{START_ISSUER}/authorize"),
+            &format!("{START_ISSUER}/token"),
+            None,
+        )
     }
 
     fn par_ok() -> PostOutcome {
@@ -1785,10 +1785,14 @@ mod tests {
     async fn a_non_https_authorization_endpoint_fails_the_login() -> Result<()> {
         let stores = empty_stores().await;
         let client = client_at("https://app.example.com");
-        let downgraded = AuthorizationServer {
-            authorization_endpoint: "http://auth.example.com/authorize".into(),
-            ..started_server()
-        };
+        let started = started_server();
+        let downgraded = crate::testing::authorization_server(
+            started.issuer(),
+            started.par_endpoint(),
+            "http://auth.example.com/authorize",
+            started.token_endpoint(),
+            started.revocation_endpoint(),
+        );
         let (started, _) = run_start_against(
             &client,
             &stores,
@@ -1959,13 +1963,13 @@ mod tests {
     const DISCOVERED_TOKEN_ENDPOINT: &str = "https://token.example.net/oauth/v2/token";
 
     fn server_at(issuer: &str) -> AuthorizationServer {
-        AuthorizationServer {
-            issuer: issuer.into(),
-            par_endpoint: format!("{issuer}/par"),
-            authorization_endpoint: format!("{issuer}/authorize"),
-            token_endpoint: DISCOVERED_TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: None,
-        }
+        crate::testing::authorization_server(
+            issuer,
+            &format!("{issuer}/par"),
+            &format!("{issuer}/authorize"),
+            DISCOVERED_TOKEN_ENDPOINT,
+            None,
+        )
     }
 
     /// Drive `complete_with`, recording all three boundaries. Fully OFFLINE:

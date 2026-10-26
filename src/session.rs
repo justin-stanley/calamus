@@ -258,12 +258,12 @@ impl<'a> RefreshContext<'a> {
         client_key: Option<&'a SigningKey>,
     ) -> Self {
         Self {
-            token_endpoint: &server.token_endpoint,
+            token_endpoint: server.token_endpoint(),
             client_id,
             auth_method,
             client_key,
-            revocation_endpoint: server.revocation_endpoint.as_deref(),
-            issuer: &server.issuer,
+            revocation_endpoint: server.revocation_endpoint(),
+            issuer: server.issuer(),
         }
     }
 

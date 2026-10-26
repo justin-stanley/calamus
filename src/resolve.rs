@@ -211,9 +211,12 @@ async fn did_from_well_known(fetcher: &Fetcher, handle: &str) -> Result<String> 
         .with_context(|| format!("fetching {url}"))?;
     let status = response.status().as_u16();
     // A 4xx: nothing is served for that handle (a typo, or no such account),
-    // typed so a login form can say so. Anything else (a 5xx, a 3xx it would
-    // not follow) is not evidence of absence, and stays untyped.
-    if (400..500).contains(&status) {
+    // typed so a login form can say so. Except 408 and 429 (transient: try
+    // again later) and 403 (a bot challenge in front of a custom-domain
+    // handle is common, and says nothing about the handle). Those, and
+    // anything else (a 5xx, a 3xx it would not follow), are not evidence of
+    // absence, and stay untyped.
+    if is_no_did_status(status) {
         return Err(identity::no_did(
             handle,
             crate::error::NoDidReason::WellKnownStatus { url, status },
@@ -225,6 +228,12 @@ async fn did_from_well_known(fetcher: &Fetcher, handle: &str) -> Result<String> 
     let body = fetcher.read_capped(response).await?;
     identity::did_from_well_known(handle, &String::from_utf8_lossy(&body))
         .with_context(|| format!("reading {url}"))
+}
+
+/// Whether a `/.well-known/atproto-did` status says the handle names no DID:
+/// a `4xx` other than `403`, `408` and `429`.
+fn is_no_did_status(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 403 | 408 | 429)
 }
 
 /// Resolve a handle to a DID: DNS first, then well-known.
@@ -446,8 +455,19 @@ mod tests {
     /// "no such handle" would tell a user to retype a correct handle. The
     /// text is the same either way.
     #[tokio::test]
-    async fn a_well_known_4xx_is_no_did_and_a_5xx_is_not() {
-        for (status, typed) in [(404, true), (410, true), (503, false), (500, false)] {
+    async fn a_well_known_4xx_is_no_did_but_403_408_429_and_5xx_are_not() {
+        for (status, typed) in [
+            (404, true),
+            (410, true),
+            (400, true),
+            // A bot challenge in front of a custom-domain handle, a timeout,
+            // a rate limit: not evidence that the handle names no DID.
+            (403, false),
+            (408, false),
+            (429, false),
+            (503, false),
+            (500, false),
+        ] {
             let (addr, _log) = crate::testing::spawn_tls(move |_| {
                 let mut r = std::collections::HashMap::new();
                 r.insert(

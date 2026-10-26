@@ -158,10 +158,7 @@ async fn server_revoking_at(
     session: &calamus::store::Session,
     endpoint: Option<&str>,
 ) -> AuthorizationServer {
-    AuthorizationServer {
-        revocation_endpoint: endpoint.map(str::to_string),
-        ..w.discover_for(session).await.unwrap()
-    }
+    calamus::testing::with_revocation_endpoint(w.discover_for(session).await.unwrap(), endpoint)
 }
 
 /// A started and approved login's callback parameters and binding token.
@@ -972,5 +969,48 @@ mod typed {
             Error::from(err),
             Error::Callback(CallbackError::NoPendingLogin)
         ));
+    }
+
+    /// **`Error::from` on a public-API error is usually `Other`, and the
+    /// decision is still reachable with `decision()`.** Calamus wraps its own
+    /// resolution, discovery and fetch errors in context, so `Client::start`
+    /// for a handle whose well-known file 404s converts to `Other` (the
+    /// context is kept), and `decision()` looks inside for the `NoDid`.
+    #[tokio::test]
+    async fn a_converted_public_api_error_reaches_its_decision() {
+        let (err, rendered) = typed(Trigger::HandleWellKnown404).await;
+        let converted = Error::from(err);
+        assert!(matches!(converted, Error::Other(_)), "{converted:?}");
+        assert_eq!(format!("{converted:#}"), rendered, "text unchanged");
+        match converted.decision() {
+            Some(Error::Resolution(ResolutionError::NoDid { handle, .. })) => {
+                assert_eq!(handle, HANDLE)
+            }
+            other => panic!("{other:?}: {rendered}"),
+        }
+        // A typed error converts to its variant, and is its own decision.
+        let (err, _) = typed(Trigger::UnknownState).await;
+        let converted = Error::from(err);
+        assert!(matches!(
+            converted.decision(),
+            Some(Error::Callback(CallbackError::NoPendingLogin))
+        ));
+        // No decision at all: None.
+        let (err, _) = typed(Trigger::JwsTwoSegments).await;
+        assert!(Error::from(err).decision().is_none());
+    }
+
+    /// **`invalidates_session()` sees through `Other`**: an `invalid_grant`
+    /// under a caller's context converts to `Other` and still says the
+    /// session is gone.
+    #[tokio::test]
+    async fn an_invalid_grant_under_context_still_invalidates_the_session() {
+        let (err, _) = typed(Trigger::InvalidGrant).await;
+        let converted = Error::from(err.context("refreshing for the feed"));
+        assert!(matches!(converted, Error::Other(_)), "{converted:?}");
+        assert!(converted.invalidates_session(), "{converted:#}");
+        // And a transient refresh failure under context does not.
+        let (err, _) = typed(Trigger::Refresh503).await;
+        assert!(!Error::from(err.context("refreshing")).invalidates_session());
     }
 }
