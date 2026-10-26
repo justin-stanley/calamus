@@ -62,7 +62,8 @@ pub enum Revocation {
     ///   and the delete after it failed too (reason "reading the session: ...;
     ///   deleting it also failed: ...", nothing revoked);
     /// * from `sign_out_with` or `sign_out_checked`, the injected revocation
-    ///   (or `refuse`) itself returned `LeftInPlace`: the row is not deleted.
+    ///   itself returned `LeftInPlace`, or `sign_out_checked`'s `refuse` gave a
+    ///   reason (which becomes this one): the row is not deleted.
     ///
     /// Deleting in the first two cases would drop a live grant with no record
     /// left to revoke it from; in the third the store did not let us. **The
@@ -433,10 +434,10 @@ pub async fn sign_out(
             crate::discovery::same_issuer(ctx.issuer, &session.issuer)
                 .err()
                 .map(|err| {
-                    Revocation::LeftInPlace(format!(
+                    format!(
                         "{err:#}; the session was left in place for a sign-out at its own \
                          authorization server"
-                    ))
+                    )
                 })
         },
         |session| async move { revoke_tokens_at(fetcher, nonces, ctx, &session, clock).await },
@@ -459,6 +460,19 @@ pub async fn sign_out(
 /// **A `revoke` that returns [`Revocation::LeftInPlace`] leaves the row**: it
 /// is treated as a refusal and nothing is deleted. To refuse a row before
 /// anything is sent for it, use [`sign_out_checked`].
+///
+/// **A [`revoke_tokens`] that refuses the row deletes it.** Called inside the
+/// attempt with a context for one issuer, `revoke_tokens` refuses another
+/// issuer's row (nothing is sent) but reports that as [`Revocation::Failed`],
+/// not `LeftInPlace`, so the row IS deleted and that grant stays live at its
+/// own server with nothing left to revoke it from. To keep such a row, refuse
+/// it with [`sign_out_checked`]'s `refuse` (comparing `row.issuer`, as
+/// [`sign_out`] does).
+///
+/// A caller that must purge the row whatever happens (account deletion) and
+/// gets [`Revocation::LeftInPlace`] calls
+/// [`SessionStore::delete`] itself: the
+/// sign-out leaves the row deliberately and never deletes on a refusal.
 #[cfg(feature = "revoke")]
 pub async fn sign_out_with<S, F, Fut>(
     store: &S,
@@ -475,10 +489,11 @@ where
 }
 
 /// [`sign_out_with`], with `refuse` asked about each row read before anything
-/// is sent for it, on the FIRST read and on every re-read: `Some(outcome)`
-/// ends the sign-out with that outcome (a [`Revocation::LeftInPlace`]), the
-/// row neither revoked nor deleted. [`sign_out`] refuses another issuer's row
-/// this way.
+/// is sent for it, on the FIRST read and on every re-read: `Some(reason)`
+/// ends the sign-out as [`Revocation::LeftInPlace`]`(reason)`, the row neither
+/// revoked nor deleted. [`sign_out`] refuses another issuer's row this way.
+/// `refuse` returns only the reason, never an outcome: a refused user is still
+/// signed in, so the outcome can only be `LeftInPlace`.
 ///
 /// For a caller that injects its revocation and can decide from the row alone
 /// (its `issuer`, say) that it must not be signed out here. A decision only the
@@ -511,16 +526,33 @@ where
 ///     &store,
 ///     did,
 ///     std::time::Duration::from_secs(5),
-///     |row| {
-///         (row.issuer != ours)
-///             .then(|| Revocation::LeftInPlace(format!("{} is another server's", row.issuer)))
-///     },
+///     |row| (row.issuer != ours).then(|| format!("{} is another server's", row.issuer)),
 ///     |_row| async { unreachable!("refused before anything is sent") },
 /// )
 /// .await;
 /// assert!(matches!(outcome, Revocation::LeftInPlace(_)));
 /// assert!(store.get(did).await.unwrap().is_some(), "the row is left");
 /// # }
+/// ```
+///
+/// A refusal cannot claim any other outcome: a `refuse` returning
+/// `Some(Revocation::Revoked)` (a still-signed-in user reported as signed
+/// out) does not compile.
+///
+/// ```compile_fail,E0308
+/// use calamus::revoke::{sign_out_checked, Revocation};
+/// use calamus::store::memory::MemorySessions;
+///
+/// async fn lie(store: &MemorySessions) -> Revocation {
+///     sign_out_checked(
+///         store,
+///         "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+///         std::time::Duration::from_secs(5),
+///         |_row| Some(Revocation::Revoked),
+///         |_row| async { Revocation::Revoked },
+///     )
+///     .await
+/// }
 /// ```
 #[cfg(feature = "revoke")]
 pub async fn sign_out_checked<S, R, F, Fut>(
@@ -532,7 +564,7 @@ pub async fn sign_out_checked<S, R, F, Fut>(
 ) -> Revocation
 where
     S: SessionStore,
-    R: Fn(&Session) -> Option<Revocation>,
+    R: Fn(&Session) -> Option<String>,
     F: FnMut(Session) -> Fut,
     Fut: std::future::Future<Output = Revocation>,
 {
@@ -562,8 +594,8 @@ where
                 };
             }
         };
-        if let Some(refused) = refuse(&session) {
-            return refused;
+        if let Some(reason) = refuse(&session) {
+            return Revocation::LeftInPlace(reason);
         }
 
         match bounded_then_delete(store, sub, &version, deadline, revoke(session)).await {
@@ -1445,7 +1477,7 @@ mod tests {
                 &store,
                 DID,
                 TEST_DEADLINE,
-                |_| Some(Revocation::LeftInPlace("refused".into())),
+                |_| Some("refused".to_string()),
                 |_| {
                     called.store(true, std::sync::atomic::Ordering::SeqCst);
                     async { Revocation::Revoked }

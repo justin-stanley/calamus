@@ -210,12 +210,11 @@ async fn did_from_well_known(fetcher: &Fetcher, handle: &str) -> Result<String> 
         .await
         .with_context(|| format!("fetching {url}"))?;
     let status = response.status().as_u16();
-    // A 4xx: nothing is served for that handle (a typo, or no such account),
-    // typed so a login form can say so. Except 408 and 429 (transient: try
-    // again later) and 403 (a bot challenge in front of a custom-domain
-    // handle is common, and says nothing about the handle). Those, and
-    // anything else (a 5xx, a 3xx it would not follow), are not evidence of
-    // absence, and stay untyped.
+    // A 400, 404 or 410: nothing is served for that handle (a typo, or no
+    // such account), typed so a login form can say so. An allowlist: every
+    // other status (403 from a bot challenge in front of a custom-domain
+    // handle, 401/407 auth, 408/425/429 transient, 421, 451, a 5xx, a 3xx it
+    // would not follow) is not evidence of absence, and stays untyped.
     if is_no_did_status(status) {
         return Err(identity::no_did(
             handle,
@@ -231,9 +230,9 @@ async fn did_from_well_known(fetcher: &Fetcher, handle: &str) -> Result<String> 
 }
 
 /// Whether a `/.well-known/atproto-did` status says the handle names no DID:
-/// a `4xx` other than `403`, `408` and `429`.
+/// `400`, `404` or `410`, and nothing else.
 fn is_no_did_status(status: u16) -> bool {
-    (400..500).contains(&status) && !matches!(status, 403 | 408 | 429)
+    matches!(status, 400 | 404 | 410)
 }
 
 /// Resolve a handle to a DID: DNS first, then well-known.
@@ -450,12 +449,13 @@ mod tests {
         );
     }
 
-    /// **A well-known 4xx is `NoDid`; a 5xx is not.** A 404 says nothing is
-    /// served for that handle (a typo); a 503 is an outage, and calling it
-    /// "no such handle" would tell a user to retype a correct handle. The
-    /// text is the same either way.
+    /// **Only a well-known 400, 404 or 410 is `NoDid`.** A 404 says nothing
+    /// is served for that handle (a typo); any other 4xx (a bot challenge,
+    /// auth, a rate limit) or a 503 outage is not evidence of absence, and
+    /// calling it "no such handle" would tell a user to retype a correct
+    /// handle. The text is the same either way.
     #[tokio::test]
-    async fn a_well_known_4xx_is_no_did_but_403_408_429_and_5xx_are_not() {
+    async fn only_a_well_known_400_404_410_is_no_did() {
         for (status, typed) in [
             (404, true),
             (410, true),
@@ -465,6 +465,13 @@ mod tests {
             (403, false),
             (408, false),
             (429, false),
+            // Auth, a proxy, a misdirected request, too early, legal: none says
+            // the handle names no DID.
+            (401, false),
+            (407, false),
+            (421, false),
+            (425, false),
+            (451, false),
             (503, false),
             (500, false),
         ] {

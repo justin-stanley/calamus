@@ -252,13 +252,16 @@ pub trait SessionStore: Send + Sync {
     /// (`SQLITE_BUSY`), or any failure that does not prove another writer
     /// committed, must be retried inside the store or returned as `Err`
     /// (the refresh then fails its request and revokes nothing); only a
-    /// failure that proves the row changed may be reported as `false`: under
-    /// `REPEATABLE READ`, Postgres `40001` "could not serialize access due to
-    /// concurrent update" from a version-guarded `UPDATE`, raised exactly
-    /// because a committed transaction changed the row. **Under
-    /// `SERIALIZABLE`, `40001` proves nothing**: SSI can raise it as a false
+    /// failure that proves the row changed may be reported as `false`:
+    /// Postgres `40001` "could not serialize access due to concurrent update"
+    /// from a version-guarded `UPDATE`, under `REPEATABLE READ` or
+    /// `SERIALIZABLE` alike, is raised exactly because a committed
+    /// transaction changed the row. **Under `SERIALIZABLE`, the other
+    /// `40001`, "could not serialize access due to read/write dependencies
+    /// among transactions", proves nothing**: SSI can raise it as a false
     /// positive for a row nobody changed, so retry the transaction or return
-    /// it as `Err`.
+    /// it as `Err`. (Under `READ COMMITTED` there is no such error: a
+    /// version-guarded `UPDATE` that lost simply affects 0 rows.)
     fn update_if_unchanged(
         &self,
         session: &Session,
@@ -721,8 +724,8 @@ mod tests {
     }
 
     /// A store whose conditional writes and takes fail as a `REPEATABLE READ`
-    /// transaction that lost a race does (Postgres `40001`, "could not
-    /// serialize access due to concurrent update").
+    /// or `SERIALIZABLE` transaction that lost a race does (Postgres `40001`,
+    /// "could not serialize access due to concurrent update").
     struct SerializationFailures {
         sessions: MemorySessions,
         pending: MemoryPendingLogins,

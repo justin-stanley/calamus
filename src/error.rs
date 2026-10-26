@@ -332,15 +332,16 @@ pub enum ResolutionError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NoDidReason {
-    /// No `_atproto` TXT record, and `/.well-known/atproto-did` answered a
-    /// `4xx` (a `404`: nothing is served for that handle). Not `403` (a bot
-    /// challenge), `408` or `429` (transient): those stay untyped errors.
+    /// No `_atproto` TXT record, and `/.well-known/atproto-did` answered
+    /// `400`, `404` or `410` (nothing is served for that handle). Every other
+    /// status (a `403` bot challenge, a `408`/`429` transient, any other `4xx`,
+    /// a `5xx`) stays an untyped error.
     #[error("{url} returned status {status}")]
     #[non_exhaustive]
     WellKnownStatus {
         /// The well-known URL.
         url: String,
-        /// Its status (`400..500`, never `403`, `408` or `429`).
+        /// Its status: `400`, `404` or `410`.
         status: u16,
     },
     /// The `_atproto` TXT record's `did=` value is not a DID.

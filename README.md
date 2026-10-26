@@ -16,8 +16,12 @@ The name: the calamus is the hollow shaft of a feather, the part cut into a quil
 the Latin word for the reed pen scribes wrote rubrics with. It's the piece FeatherReader and
 Rubrica share.
 
-Status: extraction in progress; the plan is
-[`design/EXTRACTION-PLAN.md`](design/EXTRACTION-PLAN.md).
+Status: the code is here. Stages 1–10 of
+[`design/EXTRACTION-PLAN.md`](design/EXTRACTION-PLAN.md) are built and gated in this repo
+(550 tests passing with `--all-features`, 463 with `--no-default-features`, doctests
+included); FeatherReader has not adopted it yet and the crate is not published. What
+remains is in the plan's status section. The gate is `scripts/ci.sh`, which ends in
+`ci: all green`.
 
 ## Running the tests
 

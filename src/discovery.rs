@@ -32,8 +32,19 @@ const ES256: &str = "ES256";
 /// The endpoints a validated authorization server offers.
 ///
 /// **Constructible only by discovery** ([`discover`], [`discover_with`],
-/// [`resolve_documents`]), which enforce that the issuer is the URL the metadata
-/// was fetched from and that every endpoint is on the issuer's origin. The
+/// [`resolve_documents`], [`validate_authorization_server`]). [`discover`] and
+/// [`discover_with`] do the fetching, so they enforce that the metadata was
+/// fetched from the issuer's own well-known URL and that the issuer is the one
+/// the PDS's protected-resource document named. With caller-supplied
+/// documents ([`resolve_documents`], [`validate_authorization_server`]) where
+/// the documents were fetched from, and the PDS→authorization-server link,
+/// are the CALLER's responsibility: calamus checks the documents against the
+/// URLs it is told and cannot know where they really came from
+/// (`resolve_documents` compares the stated fetched-from URL with the issuer
+/// the given protected-resource document names; `validate_authorization_server`
+/// takes the issuer as given). Enforced unconditionally, by every constructor:
+/// every endpoint is on the issuer's origin, which also canonicalizes the
+/// issuer (an https origin: no path, no userinfo, no default port). The
 /// fields are private and the type is `#[non_exhaustive]` because a
 /// [`RefreshContext`](crate::session::RefreshContext) or
 /// [`RevokeContext`](crate::revoke::RevokeContext) trusts the pairing of

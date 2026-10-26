@@ -1186,11 +1186,14 @@ pub mod store_contract {
     /// **Only a failure that PROVES another writer committed may be reported
     /// as the loss**: e.g. Postgres `40001` ("could not serialize access due
     /// to concurrent update") from a version-guarded `UPDATE`/`DELETE` under
-    /// `REPEATABLE READ`, which is raised exactly because the row was changed
-    /// by a committed transaction. **Under `SERIALIZABLE`, `40001` proves
-    /// nothing**: SSI raises it for read/write dependencies too, including a
-    /// false positive for a row nobody changed, so retry the transaction or
-    /// return it as an error. **A lock or busy timeout (SQLite
+    /// `REPEATABLE READ` or `SERIALIZABLE`, which is raised exactly because
+    /// the row was changed by a committed transaction. **Under
+    /// `SERIALIZABLE`, the other `40001` ("could not serialize access due to
+    /// read/write dependencies among transactions") proves nothing**: SSI can
+    /// raise it as a false positive for a row nobody changed, so retry the
+    /// transaction or return it as an error. Under `READ COMMITTED` a
+    /// version-guarded `UPDATE`/`DELETE` that lost affects 0 rows, which is
+    /// the plain `Ok(false)`. **A lock or busy timeout (SQLite
     /// `SQLITE_BUSY`, `database is locked`, a Postgres lock timeout or
     /// deadlock) proves nothing** about the row: retry it inside the store,
     /// or return it as an error. Reporting it as `Ok(false)` tells the
@@ -1208,9 +1211,9 @@ pub mod store_contract {
                  loses the race must report {lost}, not an error. Map a failure to the loss \
                  ONLY when it proves another writer committed (e.g. Postgres 40001 \
                  \"could not serialize access due to concurrent update\" from a \
-                 version-guarded UPDATE under REPEATABLE READ; under SERIALIZABLE, SSI's \
-                 40001 can be a false positive and must be retried or returned as an \
-                 error); a lock or busy timeout (SQLITE_BUSY) proves nothing and must be \
+                 version-guarded UPDATE under REPEATABLE READ or SERIALIZABLE; SSI's \
+                 \"read/write dependencies\" 40001 can be a false positive and must be \
+                 retried or returned as an error); a lock or busy timeout (SQLITE_BUSY) proves nothing and must be \
                  retried inside the store (or, outside a race, returned as an error), never \
                  reported as {lost}"
             ),
