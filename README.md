@@ -166,8 +166,7 @@ instead; [SECURITY.md](https://github.com/justin-stanley/calamus/blob/main/SECUR
 ## Contributing
 
 Issues and pull requests are welcome. [CONTRIBUTING.md](https://github.com/justin-stanley/calamus/blob/main/CONTRIBUTING.md) explains the gate every
-change passes (`scripts/ci.sh`) and how releases work. This project follows the
-[Contributor Covenant](https://github.com/justin-stanley/calamus/blob/main/CODE_OF_CONDUCT.md).
+change passes (`scripts/ci.sh`) and how releases work.
 
 ## License
 
