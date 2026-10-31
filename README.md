@@ -1,10 +1,19 @@
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/calamus-lockup-dark.svg">
+    <img alt="calamus" src="assets/calamus-lockup-light.svg" width="360">
+  </picture>
+</h1>
+
 <!-- Badges for crates.io and docs.rs are added with the first published release (design/OPEN-SOURCE.md §6). -->
+<p align="center">
+
 [![CI](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/justin-stanley/calamus/badge)](https://scorecard.dev/viewer/?uri=github.com/justin-stanley/calamus)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![MSRV 1.94](https://img.shields.io/badge/MSRV-1.94-orange.svg)](#minimum-supported-rust-version)
 
-# calamus
+</p>
 
 **An [atproto](https://atproto.com) OAuth client for Rust**: sign people in with their atproto
 identity (Bluesky, or any PDS) from a server-side app.
@@ -149,4 +158,6 @@ doesn't fit your project, open an issue to talk about it.
 ## The name
 
 The calamus is the hollow shaft of a feather: the part cut into a quill pen, and the Latin word for
-the reed pen scribes wrote rubrics with. It's the piece FeatherReader and its siblings share.
+the reed pen scribes wrote rubrics with. It's the piece FeatherReader and its siblings share,
+and it's what the logo draws: a feather whose bare shaft runs unbroken into a cut nib
+([assets/](assets/README.md)).
