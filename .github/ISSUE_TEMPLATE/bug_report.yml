@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in calamus behaves differently from what it documents.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **If this could be a security issue, stop here** and use
+        [private vulnerability reporting](https://github.com/justin-stanley/calamus/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Include the error (`calamus::Error` variant and message) if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest code that shows it. A test against `calamus::testing::fake` is ideal.
+      render: rust
+  - type: input
+    id: version
+    attributes:
+      label: calamus version or commit
+      placeholder: "0.1.0, or a git commit"
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Authorization server / PDS
+      description: Which server you were signing in to, if it matters (bsky.social, a self-hosted PDS and its version, …).
+  - type: input
+    id: rust
+    attributes:
+      label: rustc version
+      placeholder: "rustc 1.97.0"

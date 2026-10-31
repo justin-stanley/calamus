@@ -1,0 +1,21 @@
+name: Feature or API change
+description: Something calamus should do, or do differently.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The problem you're solving, in your app's terms. What can't you do today?
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Proposed shape
+      description: How you'd like the API to look, if you have an idea. Agreeing on the shape here comes before a pull request.
+  - type: textarea
+    id: spec
+    attributes:
+      label: Spec references
+      description: The parts of the atproto OAuth profile or the RFCs involved, if any.

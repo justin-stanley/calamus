@@ -4,11 +4,19 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 rust-version = "1.94"
 description = "An atproto OAuth client: identity resolution, discovery, PAR + PKCE + DPoP, private_key_jwt, sessions, revocation, and an SSRF-guarded fetcher."
-# The code is extracted from FeatherReader (AGPL-3.0-only). Until the owner chooses
-# calamus's own license, it stays under FeatherReader's, and the crate is not published.
 license = "AGPL-3.0-only"
+# Not on crates.io until FeatherReader, its reference consumer, has adopted it
+# (design/OPEN-SOURCE.md §6). The release PR for 0.1.0 removes this line.
 publish = false
-repository = "https://git.justin-stanley.com/justin/calamus"
+repository = "https://github.com/justin-stanley/calamus"
+homepage = "https://github.com/justin-stanley/calamus"
+documentation = "https://docs.rs/calamus"
+readme = "README.md"
+keywords = ["atproto", "oauth", "bluesky", "dpop", "authentication"]
+categories = ["authentication", "network-programming", "web-programming::http-client"]
+# What a published .crate carries: the library and its notices, nothing else.
+# No tests, fixtures, design notes or scripts (CI's `package` job asserts it).
+include = ["/src/**/*.rs", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md"]
 
 [dependencies]
 anyhow = "1"
@@ -106,3 +114,13 @@ required-features = ["test-util"]
 [[test]]
 name = "e2e_errors"
 required-features = ["test-util", "revoke", "xrpc"]
+
+# A complete sign-in, refresh and sign-out, offline, against the bundled fake
+# authorization server and PDS: `cargo run --example sign_in --features test-util,revoke`.
+[[example]]
+name = "sign_in"
+required-features = ["test-util", "revoke"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
