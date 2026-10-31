@@ -172,9 +172,10 @@ change passes (`scripts/ci.sh`) and how releases work. This project follows the
 ## License
 
 [AGPL-3.0-only](https://github.com/justin-stanley/calamus/blob/main/LICENSE). Linking calamus into your program makes the combination a work under
-the AGPL. If people use that program over a network, you must offer them its source (section 13).
-Your own code can stay under any compatible licence, MIT or Apache-2.0 for example, but the
-combined program is distributed under the AGPL. If that doesn't fit your project, open an issue to
+the AGPL. If you distribute that program, you must offer its source (section 6), and if you run a
+modified version as a network service, you must offer its source to its users (section 13). Your
+own code can stay under any compatible licence, MIT or Apache-2.0 for example, but the combined
+program is under the AGPL. If that doesn't fit your project, open an issue to
 talk about it.
 
 ## The name

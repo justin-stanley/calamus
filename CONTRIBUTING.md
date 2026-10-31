@@ -64,8 +64,11 @@ way. There's no CLA.
 
 Releases follow the same discipline as [FeatherReader](https://github.com/justin-stanley/feather-reader):
 
-1. **Release pull request**: the version in `Cargo.toml` and `Cargo.lock`, and *Unreleased* in the
-   changelog becomes `## X.Y.Z — date` with a summary.
+1. **Release pull request**: the version in `Cargo.toml` and `Cargo.lock`; *Unreleased* in the
+   changelog becomes `## X.Y.Z — date` with a summary; and the absolute
+   `raw.githubusercontent.com/.../main/` and `blob/main/` URLs in `README.md` and `src/lib.rs`
+   are pinned to the tag `vX.Y.Z`, so the published README and docs keep pointing at that
+   release's files.
 2. **Release candidate**: an annotated tag `vX.Y.Z-rc.N`. Release candidates are never published to
    crates.io (the release workflow refuses any tag containing `-`) and get no GitHub release.
 3. **Soak in FeatherReader.** calamus has no staging of its own, so its reference consumer is its

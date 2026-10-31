@@ -118,7 +118,7 @@
 // feature it needs.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(
-    html_logo_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-mark-light.svg"
+    html_logo_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-icon.svg"
 )]
 #![doc(
     html_favicon_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/favicon.svg"
