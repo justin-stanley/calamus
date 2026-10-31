@@ -76,14 +76,22 @@ Releases follow the same discipline as [FeatherReader](https://github.com/justin
    staging soak of at least 24 hours: a real sign-in, a token refresh, a sign-out, and a rollback.
 4. **Live PDS test**: `cargo test --test live_pds -- --ignored`, with the result recorded in the
    release pull request.
-5. **Final tag** `vX.Y.Z` on the candidate's commit. The release workflow then:
+5. **Final tag** `vX.Y.Z` on the candidate's commit, which must be on `main`. The release workflow
+   then:
+   - packages and verifies the crate in a job with no publish credential, and records its exact
+     Rust toolchain;
    - waits for the maintainer's approval in the `crates-io` environment;
-   - packages and verifies the crate in a job with no publish credential, then publishes the
-     byte-identical crate with crates.io Trusted Publishing (no stored token; the very first
-     publish, 0.1.0, uses a one-time token, because crates.io can't create a crate through
-     Trusted Publishing);
+   - on that same toolchain, re-packs the crate without compiling and checks it is byte-identical
+     to the verified one;
+   - publishes it with crates.io Trusted Publishing (no stored token; the very first publish,
+     0.1.0, uses a one-time token, because crates.io can't create a crate through Trusted
+     Publishing);
+   - confirms crates.io's checksum for the version is that crate's;
    - attests the build provenance of the `.crate` file;
-   - creates the GitHub release from the changelog section.
+   - creates the GitHub release from the changelog section, with the published `.crate` attached.
+
+   If a run fails partway, use "Re-run failed jobs". A full rerun is also safe: once the version
+   is on crates.io, it skips the publish and releases the crate crates.io holds.
 
 You can verify a published crate came from this repository's release workflow:
 
