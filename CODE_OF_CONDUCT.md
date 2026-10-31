@@ -6,7 +6,8 @@ personal attacks and discriminatory language aren't welcome anywhere in this pro
 
 ## Reporting
 
-To report behaviour that breaks the code of conduct, contact the maintainer,
-[@justin-stanley](https://github.com/justin-stanley), privately by email (the address is on that
-GitHub profile). Reports are kept confidential. The enforcement guidelines are those of the
+To report behaviour that breaks the code of conduct, send a private direct message on Bluesky to
+[@feather-reader.com](https://bsky.app/profile/feather-reader.com), the account of FeatherReader,
+calamus's sibling project, run by the same maintainer. Please don't report it in a public issue.
+Reports are kept confidential. The enforcement guidelines are those of the
 Contributor Covenant 2.1.
