@@ -87,7 +87,8 @@ jobs:
           # `publish = false` until 0.1.0; --no-verify skips nothing that the
           # build step below does not do, and lets this run before then.
           cargo package --locked --allow-dirty --no-verify
-          crate="$(ls target/package/calamus-*.crate)"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          crate="target/package/calamus-${version}.crate"
           echo "packaged $crate ($(stat -c %s "$crate") bytes)"
           [ "$(stat -c %s "$crate")" -le 1048576 ] || { echo "::error::$crate is over 1 MiB"; exit 1; }
           bad="$(tar -tzf "$crate" | sed 's#^[^/]*/##' \
@@ -96,7 +97,8 @@ jobs:
       - name: The packaged sources build alone
         run: |
           set -euo pipefail
-          dir="$(mktemp -d)"; tar -xzf target/package/calamus-*.crate -C "$dir"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          dir="$(mktemp -d)"; tar -xzf "target/package/calamus-${version}.crate" -C "$dir"
           cd "$dir"/calamus-* && cargo build --all-features
 
   semver:
@@ -124,24 +126,30 @@ jobs:
           tool: cargo-semver-checks@${{ env.CARGO_SEMVER_CHECKS_VERSION }}
       - name: cargo semver-checks
         if: steps.base.outputs.tag != ''
-        run: cargo semver-checks --baseline-rev "${{ steps.base.outputs.tag }}" --all-features
+        env:
+          BASELINE: ${{ steps.base.outputs.tag }}
+        run: cargo semver-checks --baseline-rev "$BASELINE" --all-features
 
   docs-rs:
     name: docs.rs
     # Builds the docs the way docs.rs does (nightly, all features, --cfg docsrs),
-    # so a broken docs.rs page is caught before a release.
+    # so a broken docs.rs page is caught before a release. The nightly is pinned,
+    # so a new rustdoc lint can't turn an unrelated pull request red; bump it
+    # deliberately.
     runs-on: ubuntu-latest
+    env:
+      NIGHTLY: nightly-2026-10-30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: nightly
+          toolchain: ${{ env.NIGHTLY }}
       - name: cargo doc (docs.rs settings)
         env:
           RUSTDOCFLAGS: --cfg docsrs -D warnings
-        run: cargo +nightly doc --no-deps --all-features --locked
+        run: cargo "+$NIGHTLY" doc --no-deps --all-features --locked
 
   cargo-deny:
     name: cargo deny (licenses + bans + sources)

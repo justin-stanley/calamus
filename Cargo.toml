@@ -9,7 +9,6 @@ license = "AGPL-3.0-only"
 # (design/OPEN-SOURCE.md §6). The release PR for 0.1.0 removes this line.
 publish = false
 repository = "https://github.com/justin-stanley/calamus"
-homepage = "https://github.com/justin-stanley/calamus"
 documentation = "https://docs.rs/calamus"
 readme = "README.md"
 keywords = ["atproto", "oauth", "bluesky", "dpop", "authentication"]

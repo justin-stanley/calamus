@@ -1,16 +1,18 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/calamus-lockup-dark.svg">
-    <img alt="calamus" src="assets/calamus-lockup-light.svg" width="360">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-lockup-dark.svg">
+    <img alt="calamus" src="https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-lockup-light.svg" width="360">
   </picture>
 </h1>
 
-<!-- Badges for crates.io and docs.rs are added with the first published release (design/OPEN-SOURCE.md §6). -->
+<!-- Absolute URLs throughout: crates.io and docs.rs render this file without the repository.
+     At each release, the release PR pins them from main to the release tag. Badges for
+     crates.io and docs.rs are added with the first published release (design/OPEN-SOURCE.md §6). -->
 <p align="center">
 
 [![CI](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/justin-stanley/calamus/badge)](https://scorecard.dev/viewer/?uri=github.com/justin-stanley/calamus)
-[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](https://github.com/justin-stanley/calamus/blob/main/LICENSE)
 [![MSRV 1.94](https://img.shields.io/badge/MSRV-1.94-orange.svg)](#minimum-supported-rust-version)
 
 </p>
@@ -43,13 +45,13 @@ an atproto-native feed reader, where it was written and from which it was extrac
 
 > **Status: pre-release.** The code is complete and tested, but calamus is not on crates.io yet.
 > It will be published as 0.1.0 once FeatherReader has switched to it
-> ([the plan](design/OPEN-SOURCE.md)). Until then, depend on it by git tag.
+> ([the plan](https://github.com/justin-stanley/calamus/blob/main/design/OPEN-SOURCE.md)). Until then, depend on it from git, pinned to a commit.
 
 ## Quick start
 
 ```toml
 [dependencies]
-calamus = { git = "https://github.com/justin-stanley/calamus" }
+calamus = { git = "https://github.com/justin-stanley/calamus", rev = "<commit>" }
 ```
 
 ```rust,ignore
@@ -91,10 +93,27 @@ appears to do nothing. Answer with a small page that continues with
 | `dns` | yes | `resolve::SystemResolver`: handle lookup by DNS TXT through the system's resolver |
 | `revoke` | no | `revoke::sign_out`: revoke a session's tokens, then delete it, safely against a concurrent refresh |
 | `xrpc` | no | `xrpc::Repo`: DPoP-bound XRPC calls to the user's PDS |
-| `test-util` | no | `calamus::testing`: the fake authorization server, PDS, PLC directory and DNS. **Use it only in `[dev-dependencies]`**, because it can bypass the SSRF guard for named hosts |
+| `test-util` | no | `calamus::testing`: the fake authorization server, PDS, PLC directory and DNS; `testing::store_contract`; `client_auth::record_evidence`. **Use it only in `[dev-dependencies]`**, because it can bypass the SSRF guard for named hosts |
 
 Storage is yours: implement the `store` traits (`SessionStore`, `PendingLoginStore`, `NonceStore`)
 on your database. In-memory versions are included for tests and single-process apps.
+
+The rules a store must keep are subtle: conditional writes, single-use pending logins, no
+resurrection after a sign-out. So calamus ships them as a test suite. Run it against your
+implementation (with `test-util` in `[dev-dependencies]`):
+
+```rust,ignore
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn my_store_keeps_calamus_rules() {
+    calamus::testing::store_contract::sessions(&MyStore::empty().await).await;
+    calamus::testing::store_contract::pending(&MyStore::empty().await).await;
+    // The races: N tasks contending for R rounds each, on a multi-threaded runtime.
+    let racy = std::sync::Arc::new(MyStore::empty().await);
+    calamus::testing::store_contract::sessions_conditional_writes_are_atomic(racy, 8, 200).await;
+    let racy = std::sync::Arc::new(MyStore::empty().await);
+    calamus::testing::store_contract::pending_take_is_atomic(racy, 8, 200).await;
+}
+```
 
 ## How it's tested
 
@@ -136,28 +155,31 @@ cargo test --test live_pds -- --ignored   # the one test that talks to a real PD
 
 ## Minimum supported Rust version
 
-1.94. Raising it is a minor-version change and is called out in the [changelog](CHANGELOG.md).
+1.94. Raising it is a minor-version change and is called out in the [changelog](https://github.com/justin-stanley/calamus/blob/main/CHANGELOG.md).
 
 ## Security
 
 calamus is security-sensitive by nature. Please **don't** report vulnerabilities in public
 issues. Use [private vulnerability reporting](https://github.com/justin-stanley/calamus/security/advisories/new)
-instead; [SECURITY.md](SECURITY.md) has the details and what to expect.
+instead; [SECURITY.md](https://github.com/justin-stanley/calamus/blob/main/SECURITY.md) has the details and what to expect.
 
 ## Contributing
 
-Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains the gate every
+Issues and pull requests are welcome. [CONTRIBUTING.md](https://github.com/justin-stanley/calamus/blob/main/CONTRIBUTING.md) explains the gate every
 change passes (`scripts/ci.sh`) and how releases work. This project follows the
-[Contributor Covenant](CODE_OF_CONDUCT.md).
+[Contributor Covenant](https://github.com/justin-stanley/calamus/blob/main/CODE_OF_CONDUCT.md).
 
 ## License
 
-[AGPL-3.0-only](LICENSE). That includes code that links calamus into a network service. If that
-doesn't fit your project, open an issue to talk about it.
+[AGPL-3.0-only](https://github.com/justin-stanley/calamus/blob/main/LICENSE). Linking calamus into your program makes the combination a work under
+the AGPL. If people use that program over a network, you must offer them its source (section 13).
+Your own code can stay under any compatible licence, MIT or Apache-2.0 for example, but the
+combined program is distributed under the AGPL. If that doesn't fit your project, open an issue to
+talk about it.
 
 ## The name
 
 The calamus is the hollow shaft of a feather: the part cut into a quill pen, and the Latin word for
 the reed pen scribes wrote rubrics with. It's the piece FeatherReader and its siblings share,
 and it's what the logo draws: a feather whose bare shaft runs unbroken into a cut nib
-([assets/](assets/README.md)).
+([assets/](https://github.com/justin-stanley/calamus/blob/main/assets/README.md)).

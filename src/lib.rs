@@ -107,12 +107,22 @@
 //! | `dns` | yes | `resolve::SystemResolver`: handle lookup by DNS TXT through the system resolver |
 //! | `revoke` | no | `revoke::sign_out` and `sign_out_with` (the RFC 7009 request itself is always built) |
 //! | `xrpc` | no | `xrpc::Repo`: DPoP-bound XRPC calls |
-//! | `test-util` | no | `testing`: the fake authorization server, PDS, PLC and DNS. **Only ever in `[dev-dependencies]`**: it can bypass the SSRF guard for named hosts |
+//! | `test-util` | no | `testing`: the fake authorization server, PDS, PLC and DNS, `testing::store_contract` (the rules a store must keep), and `client_auth::record_evidence`. **Only ever in `[dev-dependencies]`**: it can bypass the SSRF guard for named hosts |
 //!
 //! # Time
 //!
 //! Functions take the time as `now` (Unix seconds) rather than reading a clock,
 //! so tests can pin it.
+
+// docs.rs builds with every feature and `--cfg docsrs`: label each item with the
+// feature it needs.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-mark-light.svg"
+)]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/favicon.svg"
+)]
 
 pub mod error;
 pub mod identity;

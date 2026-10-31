@@ -75,7 +75,10 @@ Releases follow the same discipline as [FeatherReader](https://github.com/justin
    release pull request.
 5. **Final tag** `vX.Y.Z` on the candidate's commit. The release workflow then:
    - waits for the maintainer's approval in the `crates-io` environment;
-   - publishes with crates.io Trusted Publishing (no stored token);
+   - packages and verifies the crate in a job with no publish credential, then publishes the
+     byte-identical crate with crates.io Trusted Publishing (no stored token; the very first
+     publish, 0.1.0, uses a one-time token, because crates.io can't create a crate through
+     Trusted Publishing);
    - attests the build provenance of the `.crate` file;
    - creates the GitHub release from the changelog section.
 

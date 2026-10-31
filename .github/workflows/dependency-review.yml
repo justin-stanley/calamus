@@ -1,7 +1,8 @@
 name: Dependency review
-# Flags a pull request that adds a dependency with a known vulnerability or a
-# license outside deny.toml's list. Advisory: cargo-deny and cargo-audit in CI
-# are the gates.
+# Flags a pull request that adds a dependency with a known vulnerability.
+# Advisory: cargo-deny (licenses, bans, sources) and cargo-audit in CI are the
+# gates. On pull requests from forks the token is read-only, so the summary
+# comment is skipped there; the check itself still runs.
 
 on:
   pull_request:
