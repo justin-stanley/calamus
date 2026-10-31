@@ -19,6 +19,7 @@ jobs:
     permissions:
       security-events: write
       contents: read
+      actions: read # CodeQL reads the workflow run; required while the repo is private
     strategy:
       fail-fast: false
       matrix:
