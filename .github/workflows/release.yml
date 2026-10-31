@@ -31,7 +31,11 @@ name: Release
 # under "Use workflow from") also works: once the version is on crates.io it
 # skips the publish, downloads the published .crate, checks it against
 # crates.io's checksum, and releases that (a rebuild under a newer cargo may
-# not reproduce it). A yanked version is refused.
+# not reproduce it). A yanked version is refused. Two limits of a full rerun:
+# its `build` must still pass on the current stable Rust (so "Re-run failed
+# jobs" is the safer choice), and when its rebuild differs from the published
+# crate, the attestation it makes covers the crate as published from this tag,
+# not bytes this run built (the run says so in a notice).
 
 on:
   push:
@@ -64,11 +68,10 @@ jobs:
         run: |
           set -euo pipefail
           [ "$REF_TYPE" = tag ] || { echo "::error::run this on a tag, not $REF_TYPE $TAG"; exit 1; }
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*-*) echo "::error::$TAG is a release candidate: it soaks in FeatherReader and is never published"; exit 1 ;;
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::$TAG is not a vX.Y.Z tag"; exit 1 ;;
-          esac
+          if [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            echo "::error::$TAG is a release candidate: it soaks in FeatherReader and is never published"; exit 1
+          fi
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a vX.Y.Z tag"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
             || { echo "::error::$TAG ($GITHUB_SHA) is not on main"; exit 1; }
           version="${TAG#v}"
@@ -139,8 +142,8 @@ jobs:
         id: state
         run: |
           set -euo pipefail
-          crate="$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" https://crates.io/api/v1/crates/calamus)"
-          version="$(curl -s -o "$RUNNER_TEMP/version.json" -w '%{http_code}' -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION")"
+          crate="$(curl -s --max-time 20 --retry 3 -o /dev/null -w '%{http_code}' -A "$UA" https://crates.io/api/v1/crates/calamus)"
+          version="$(curl -s --max-time 20 --retry 3 -o "$RUNNER_TEMP/version.json" -w '%{http_code}' -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION")"
           case "$crate/$version" in
             404/404) echo "first=true" >> "$GITHUB_OUTPUT"; echo "published=false" >> "$GITHUB_OUTPUT" ;;
             200/404) echo "first=false" >> "$GITHUB_OUTPUT"; echo "published=false" >> "$GITHUB_OUTPUT" ;;
@@ -182,7 +185,7 @@ jobs:
           sum=""
           for _ in $(seq 1 30); do
             # `|| true`: a network error or a non-JSON error page is a retry, not a failure.
-            sum="$(curl -s -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION" | jq -r '.version.checksum // empty' 2>/dev/null || true)"
+            sum="$(curl -s --max-time 20 -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION" | jq -r '.version.checksum // empty' 2>/dev/null || true)"
             [ -n "$sum" ] && break
             sleep 10
           done
@@ -197,7 +200,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/package
-          curl -sSfL -A "$UA" "https://static.crates.io/crates/calamus/calamus-${VERSION}.crate" -o "$CRATE"
+          curl -sSfL --max-time 60 --retry 3 -A "$UA" "https://static.crates.io/crates/calamus/calamus-${VERSION}.crate" -o "$CRATE"
           want="$(jq -r '.version.checksum' "$RUNNER_TEMP/version.json")"
           got="$(sha256sum "$CRATE" | cut -d' ' -f1)"
           [ "$got" = "$want" ] || { echo "::error::the downloaded crate $got does not match crates.io's checksum $want"; exit 1; }
@@ -216,7 +219,7 @@ jobs:
 
   github-release:
     name: GitHub release
-    needs: [check, build, publish]
+    needs: [check, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
