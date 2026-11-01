@@ -32,8 +32,11 @@ hickory-resolver = { version = "0.26.3", default-features = false, features = ["
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "ecdsa", "std"] }
 # The SSRF-guarded fetcher (`net`). FeatherReader's exact spec: rustls rather than
 # native-tls, gzip because FeatherReader's feed fetch shares the fetcher, json for
-# the callers' request bodies.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "json"] }
+# the callers' request bodies. ring, not aws-lc-rs: no CMake and no aws-lc in any
+# consumer's build; ring still compiles its own C and assembly with `cc`; the provider
+# is installed by `net::install_crypto_provider`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "gzip", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

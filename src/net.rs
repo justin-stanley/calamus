@@ -1092,8 +1092,15 @@ impl PinnedClients {
     }
 }
 
-/// Installs ring as rustls's process-wide provider (stub).
-pub fn install_crypto_provider() {}
+/// Installs ring as rustls's process-wide provider, once; a provider
+/// already installed (ring or another) is left alone. Called before the
+/// first client is built; harmless to call again.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// The builder for a per-hop client that **pins** DNS for `host` to the
 /// already-vetted `addr`, so reqwest's `connect` reuses the exact IP that passed
@@ -1104,6 +1111,7 @@ pub fn install_crypto_provider() {}
 /// slow-upstream defence on every hop), and auto-redirect off — [`Fetcher::get`]
 /// follows and re-validates each hop itself.
 fn pinned_builder(policy: &FetchPolicy, host: &str, addr: SocketAddr) -> ClientBuilder {
+    install_crypto_provider();
     Client::builder()
         .user_agent(policy.user_agent.as_str())
         // Bound each hop: a total request timeout plus a per-read idle timeout.
