@@ -1092,6 +1092,9 @@ impl PinnedClients {
     }
 }
 
+/// Installs ring as rustls's process-wide provider (stub).
+pub fn install_crypto_provider() {}
+
 /// The builder for a per-hop client that **pins** DNS for `host` to the
 /// already-vetted `addr`, so reqwest's `connect` reuses the exact IP that passed
 /// the SSRF check instead of doing its own second resolution (the DNS-rebinding

@@ -8,6 +8,11 @@ target=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,s
 case "$target" in "$PWD"/target) ;; *) echo "target dir is $target, not $PWD/target: unset CARGO_TARGET_DIR"; exit 1;; esac
 cargo fmt --all --check
 cargo build --all-targets --all-features --locked
+# ring, not aws-lc: CMake and aws-lc must never be needed (ring still compiles its
+# own C and asm with cc). `cargo tree -i` exits non-zero when the crate is absent,
+# so the check is inverted.
+if cargo tree -i aws-lc-sys --locked >/dev/null 2>&1; then echo "ci: aws-lc-sys is in the graph"; exit 1; fi
+if cargo tree -i aws-lc-rs --locked >/dev/null 2>&1; then echo "ci: aws-lc-rs is in the graph"; exit 1; fi
 cargo test --all-features --locked
 # That run includes the end-to-end suites (tests/e2e_*.rs, against
 # calamus::testing::fake). They need no network: every host they reach is a host
