@@ -1289,6 +1289,13 @@ pub fn safe_link(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare client builder with the provider installed first: with
+    /// `rustls-no-provider`, `build()` panics when no process default is set.
+    fn bare_client() -> reqwest::ClientBuilder {
+        install_crypto_provider();
+        reqwest::Client::builder()
+    }
     use crate::testing::{
         serve_body, serve_redirect_to_final, spawn_tls, test_host_override, TestResponse,
     };
@@ -1825,7 +1832,7 @@ mod tests {
         // rightly forbids loopback) to exercise read_capped on a real Response.
         let big = vec![b'x'; MAX_BODY_BYTES + 1];
         let base = serve_body(big).await;
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = bare_client().build().unwrap();
         let resp = client.get(&base).send().await.unwrap();
         let err = Fetcher::default().read_capped(resp).await.unwrap_err();
         assert!(
@@ -1848,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn read_capped_accepts_small_body() {
         let base = serve_body(b"hello world".to_vec()).await;
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = bare_client().build().unwrap();
         let resp = client.get(&base).send().await.unwrap();
         let body = Fetcher::default().read_capped(resp).await.unwrap();
         assert_eq!(body, b"hello world");
@@ -3238,7 +3245,7 @@ mod tests {
             }
         });
 
-        let client = Client::builder()
+        let client = bare_client()
             .no_proxy()
             .timeout(Duration::from_millis(250))
             .build()
@@ -3593,7 +3600,7 @@ mod tests {
         );
         assert_eq!(log.lock().unwrap().len(), 2);
 
-        let plain = reqwest::Client::builder().no_proxy().build().unwrap();
+        let plain = bare_client().no_proxy().build().unwrap();
         let over = plain
             .get(serve_body(vec![b'x'; 11]).await)
             .send()
