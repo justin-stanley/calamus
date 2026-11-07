@@ -1,7 +1,7 @@
 name: CI
 # The gate. `Rust` runs scripts/ci.sh, the same script contributors run locally;
 # the supply-chain and secret checks are their own jobs so each is a required
-# status check by name (see design/OPEN-SOURCE.md §3).
+# status check by name.
 #
 # Unlike FeatherReader's (which once ran on a self-hosted runner), this runs on
 # pull requests from forks too: everything is GitHub-hosted, the token is

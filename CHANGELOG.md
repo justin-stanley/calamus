@@ -25,8 +25,8 @@ fetcher, extracted into a library. Not yet published.
   `did:plc` and `did:web`), authorization-server discovery with issuer checks, PAR + PKCE + DPoP,
   `private_key_jwt`, the callback with RFC 9207 `iss` and a browser-binding check, the `sub` check
   on the token response, refresh with rotating refresh tokens, revocation (RFC 7009), and
-  DPoP-bound XRPC calls. Built test-first in ten stages
-  ([design/EXTRACTION-PLAN.md](design/EXTRACTION-PLAN.md)), then reviewed repeatedly until a full
+  DPoP-bound XRPC calls. Built test-first in ten stages,
+  then reviewed repeatedly until a full
   pass found nothing above Low.
 - **Storage traits** (`store::SessionStore`, `PendingLoginStore`, `NonceStore`), with in-memory
   versions and `store::Discard` for sign-in-only clients.

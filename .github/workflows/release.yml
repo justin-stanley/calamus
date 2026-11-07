@@ -1,7 +1,6 @@
 name: Release
 # A final tag `vX.Y.Z` publishes calamus to crates.io and creates the GitHub
-# release. FeatherReader's release discipline, with additions for a library
-# (design/OPEN-SOURCE.md §5):
+# release. FeatherReader's release discipline, with additions for a library:
 #
 # * Release candidates (`vX.Y.Z-rc.N`) don't trigger this at all, and are
 #   refused if it is run on one: they soak in FeatherReader, never on crates.io.

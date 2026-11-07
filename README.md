@@ -7,7 +7,7 @@
 
 <!-- Absolute URLs throughout: crates.io and docs.rs render this file without the repository.
      At each release, the release PR pins them from main to the release tag. Badges for
-     crates.io and docs.rs are added with the first published release (design/OPEN-SOURCE.md §6). -->
+     crates.io and docs.rs are added with the first published release. -->
 <p align="center">
 
 [![CI](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/justin-stanley/calamus/actions/workflows/ci.yml)
@@ -44,8 +44,8 @@ calamus runs in production in [FeatherReader](https://github.com/justin-stanley/
 an atproto-native feed reader, where it was written and from which it was extracted.
 
 > **Status: pre-release.** The code is complete and tested, but calamus is not on crates.io yet.
-> It will be published as 0.1.0 once FeatherReader has switched to it
-> ([the plan](https://github.com/justin-stanley/calamus/blob/main/design/OPEN-SOURCE.md)). Until then, depend on it from git, pinned to a commit.
+> It will be published as 0.1.0 once FeatherReader has switched to it. Until then, depend on
+> it from git, pinned to a commit.
 
 ## Quick start
 

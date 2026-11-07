@@ -5,8 +5,8 @@ edition = "2021"
 rust-version = "1.94"
 description = "An atproto OAuth client: identity resolution, discovery, PAR + PKCE + DPoP, private_key_jwt, sessions, revocation, and an SSRF-guarded fetcher."
 license = "AGPL-3.0-only"
-# Not on crates.io until FeatherReader, its reference consumer, has adopted it
-# (design/OPEN-SOURCE.md §6). The release PR for 0.1.0 removes this line.
+# Not on crates.io until FeatherReader, its reference consumer, has adopted it.
+# The release PR for 0.1.0 removes this line.
 publish = false
 repository = "https://github.com/justin-stanley/calamus"
 documentation = "https://docs.rs/calamus"
