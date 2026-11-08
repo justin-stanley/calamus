@@ -381,27 +381,10 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    // Both `ring` and `aws-lc-rs` are reachable in this tree, so rustls refuses
-    // to guess a process-level provider for the SERVER side here. Install ring.
-    //
-    // **What reqwest 0.13 actually does** (`async_impl/client.rs`):
-    //
-    //     let provider = rustls::crypto::CryptoProvider::get_default()
-    //         .map(|arc| arc.clone())
-    //         .unwrap_or_else(default_rustls_crypto_provider);
-    //
-    // So it READS the process default and falls back to aws-lc-rs. Installing
-    // ring here therefore DOES affect reqwest clients built afterwards in the
-    // same test binary — which makes the client's provider depend on whether any
-    // test called `spawn_tls` first. Benign (ring and aws-lc-rs interoperate),
-    // and absent from release builds, where nothing installs a default and the
-    // client is genuinely aws-lc-rs.
-    //
-    // `install_default` errors if something got there first, which is fine.
-    static PROVIDER: std::sync::Once = std::sync::Once::new();
-    PROVIDER.call_once(|| {
-        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
-    });
+    // One provider path: the same idempotent install the client uses. reqwest
+    // reads the process default when it builds a client, so the server side here
+    // and the client under test share ring.
+    crate::net::install_crypto_provider();
 
     let certs: Vec<CertificateDer<'static>> = pem_certs(leaf.leaf_pem.as_bytes());
     let key: PrivateKeyDer<'static> = pem_key(leaf.leaf_key_pem.as_bytes());

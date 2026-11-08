@@ -37,6 +37,14 @@ fetcher, extracted into a library. Not yet published.
   `scripts/release-graph-check.sh` proves the seams are absent from a default build.
 - **`examples/sign_in.rs`**: a complete sign-in, refresh and sign-out, offline.
 
+### Changed
+
+- TLS uses rustls with the **ring** provider (`reqwest`'s `rustls-no-provider` + `rustls/ring`);
+  `aws-lc-sys` and CMake are gone from the graph. ring still compiles its own C and assembly, so
+  a C compiler is needed, CMake is not. `calamus::net::install_crypto_provider` installs the
+  provider idempotently; the client calls it. `scripts/ci.sh` fails if `aws-lc-sys` or
+  `aws-lc-rs` returns.
+
 ### Stricter than FeatherReader
 
 Found while extracting, and fixed here first. FeatherReader takes these fixes when it adopts
@@ -58,3 +66,8 @@ calamus:
   - NSIDs are validated;
   - `Client::new` checks that an inline JWKS publishes the signing key;
   - `Debug` output redacts codes, tokens and keys.
+
+### Upgrade notes
+
+- A consumer that installed aws-lc-rs as the process default keeps it: calamus installs ring only
+  when no provider is set.

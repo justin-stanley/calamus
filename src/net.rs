@@ -1092,6 +1092,16 @@ impl PinnedClients {
     }
 }
 
+/// Installs ring as rustls's process-wide provider, once; a provider
+/// already installed (ring or another) is left alone. Called before the
+/// first client is built; harmless to call again.
+pub fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// The builder for a per-hop client that **pins** DNS for `host` to the
 /// already-vetted `addr`, so reqwest's `connect` reuses the exact IP that passed
 /// the SSRF check instead of doing its own second resolution (the DNS-rebinding
@@ -1101,6 +1111,7 @@ impl PinnedClients {
 /// slow-upstream defence on every hop), and auto-redirect off — [`Fetcher::get`]
 /// follows and re-validates each hop itself.
 fn pinned_builder(policy: &FetchPolicy, host: &str, addr: SocketAddr) -> ClientBuilder {
+    install_crypto_provider();
     Client::builder()
         .user_agent(policy.user_agent.as_str())
         // Bound each hop: a total request timeout plus a per-read idle timeout.
@@ -1278,6 +1289,13 @@ pub fn safe_link(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare client builder with the provider installed first: with
+    /// `rustls-no-provider`, `build()` panics when no process default is set.
+    fn bare_client() -> reqwest::ClientBuilder {
+        install_crypto_provider();
+        reqwest::Client::builder()
+    }
     use crate::testing::{
         serve_body, serve_redirect_to_final, spawn_tls, test_host_override, TestResponse,
     };
@@ -1814,7 +1832,7 @@ mod tests {
         // rightly forbids loopback) to exercise read_capped on a real Response.
         let big = vec![b'x'; MAX_BODY_BYTES + 1];
         let base = serve_body(big).await;
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = bare_client().build().unwrap();
         let resp = client.get(&base).send().await.unwrap();
         let err = Fetcher::default().read_capped(resp).await.unwrap_err();
         assert!(
@@ -1837,7 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn read_capped_accepts_small_body() {
         let base = serve_body(b"hello world".to_vec()).await;
-        let client = reqwest::Client::builder().build().unwrap();
+        let client = bare_client().build().unwrap();
         let resp = client.get(&base).send().await.unwrap();
         let body = Fetcher::default().read_capped(resp).await.unwrap();
         assert_eq!(body, b"hello world");
@@ -3227,7 +3245,7 @@ mod tests {
             }
         });
 
-        let client = Client::builder()
+        let client = bare_client()
             .no_proxy()
             .timeout(Duration::from_millis(250))
             .build()
@@ -3582,7 +3600,7 @@ mod tests {
         );
         assert_eq!(log.lock().unwrap().len(), 2);
 
-        let plain = reqwest::Client::builder().no_proxy().build().unwrap();
+        let plain = bare_client().no_proxy().build().unwrap();
         let over = plain
             .get(serve_body(vec![b'x'; 11]).await)
             .send()
