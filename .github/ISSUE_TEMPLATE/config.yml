@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/justin-stanley/calamus/security/advisories/new
+    about: Please report vulnerabilities privately, not in a public issue. See SECURITY.md.
+  - name: atproto OAuth specification
+    url: https://atproto.com/specs/oauth
+    about: Questions about the protocol itself, rather than this library.

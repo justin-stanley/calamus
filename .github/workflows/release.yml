@@ -1,0 +1,253 @@
+name: Release
+# A final tag `vX.Y.Z` publishes calamus to crates.io and creates the GitHub
+# release. FeatherReader's release discipline, with additions for a library:
+#
+# * Release candidates (`vX.Y.Z-rc.N`) don't trigger this at all, and are
+#   refused if it is run on one: they soak in FeatherReader, never on crates.io.
+# * The tagged commit must be on `main`, so an unreviewed branch can't release.
+# * Nothing is compiled where the publish credential exists. `build` packages
+#   and verifies the crate (dependency build scripts and proc-macros run here)
+#   with no OIDC permission and no secrets, and records its exact toolchain.
+#   `publish`, on that toolchain, only re-packs without compiling, checks it is
+#   byte-for-byte the verified crate, publishes it, confirms crates.io's
+#   checksum for the version is that crate's, and then attests it.
+# * `publish` runs in the `crates-io` environment, which requires the
+#   maintainer's approval, so the irreversible step needs a deliberate click.
+# * The `.crate` gets SLSA build provenance, verifiable with
+#   `gh attestation verify calamus-X.Y.Z.crate --repo justin-stanley/calamus`.
+#
+# Credentials: crates.io Trusted Publishing (OIDC, nothing stored). crates.io
+# refuses Trusted Publishing for a crate's FIRST publish ("Trusted Publishing
+# tokens do not support creating new crates"), so 0.1.0 alone uses a one-time
+# token stored as the `crates-io` environment's secret
+# CRATES_IO_FIRST_PUBLISH_TOKEN: scoped to publish-new for `calamus` only, with
+# a short expiry. After 0.1.0, configure Trusted Publishing on crates.io
+# (repository justin-stanley/calamus, workflow release.yml, environment
+# crates-io) and delete the secret and the token.
+#
+# If a run fails partway, prefer "Re-run failed jobs": it keeps the original
+# build. A full rerun (Actions -> Release -> Run workflow, choosing the TAG
+# under "Use workflow from") also works: once the version is on crates.io it
+# skips the publish, downloads the published .crate, checks it against
+# crates.io's checksum, and releases that (a rebuild under a newer cargo may
+# not reproduce it). A yanked version is refused. Two limits of a full rerun:
+# its `build` must still pass on the current stable Rust (so "Re-run failed
+# jobs" is the safer choice), and when its rebuild differs from the published
+# crate, the attestation it makes covers the crate as published from this tag,
+# not bytes this run built (the run says so in a notice).
+
+on:
+  push:
+    tags: ["v*", "!v*-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0 # to check the tag is on main
+          persist-credentials: false
+      - name: A final tag on main, matching Cargo.toml, with a CHANGELOG section
+        id: check
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          [ "$REF_TYPE" = tag ] || { echo "::error::run this on a tag, not $REF_TYPE $TAG"; exit 1; }
+          if [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            echo "::error::$TAG is a release candidate: it soaks in FeatherReader and is never published"; exit 1
+          fi
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not a vX.Y.Z tag"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main \
+            || { echo "::error::$TAG ($GITHUB_SHA) is not on main"; exit 1; }
+          version="${TAG#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          [ "$crate" = "$version" ] || { echo "::error::tag $TAG but Cargo.toml says $crate"; exit 1; }
+          if grep -q '^publish = false' Cargo.toml; then
+            echo "::error::Cargo.toml still has publish = false"; exit 1
+          fi
+          scripts/release-notes.sh "$version" > /dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Package and verify
+    # Compiles the crate (and runs dependencies' build scripts) with no
+    # publish credential and no secrets in reach.
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.pkg.outputs.sha256 }}
+      # The exact toolchain, so `publish` (which may run days later, after the
+      # approval) re-packs with the same cargo and gets the same bytes.
+      rust: ${{ steps.pkg.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - name: cargo package (verifies it builds from the packaged sources)
+        id: pkg
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo package --locked
+          crate="target/package/calamus-${VERSION}.crate"
+          echo "sha256=$(sha256sum "$crate" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(rustc --version | cut -d' ' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: crate
+          path: target/package/calamus-${{ needs.check.outputs.version }}.crate
+          if-no-files-found: error
+
+  publish:
+    name: Publish to crates.io
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment: crates-io # requires the maintainer's approval
+    permissions:
+      contents: read
+      id-token: write # crates.io Trusted Publishing, and the attestation
+      attestations: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      VERIFIED: ${{ needs.build.outputs.sha256 }}
+      CRATE: target/package/calamus-${{ needs.check.outputs.version }}.crate
+      UA: calamus release (github.com/justin-stanley/calamus)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: ${{ needs.build.outputs.rust }}
+      - name: Is this version (or the crate) already on crates.io?
+        id: state
+        run: |
+          set -euo pipefail
+          crate="$(curl -s --max-time 20 --retry 3 -o /dev/null -w '%{http_code}' -A "$UA" https://crates.io/api/v1/crates/calamus)"
+          version="$(curl -s --max-time 20 --retry 3 -o "$RUNNER_TEMP/version.json" -w '%{http_code}' -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION")"
+          case "$crate/$version" in
+            404/404) echo "first=true" >> "$GITHUB_OUTPUT"; echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            200/404) echo "first=false" >> "$GITHUB_OUTPUT"; echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            200/200)
+              if [ "$(jq -r '.version.yanked' "$RUNNER_TEMP/version.json")" = true ]; then
+                echo "::error::calamus $VERSION is on crates.io but yanked; not releasing it"; exit 1
+              fi
+              echo "first=false" >> "$GITHUB_OUTPUT"; echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::calamus $VERSION is already on crates.io (a rerun): its published crate is used from here on" ;;
+            *) echo "::error::crates.io answered $crate for the crate and $version for the version"; exit 1 ;;
+          esac
+
+      # Not yet published: re-pack without compiling, check it is the verified
+      # crate, and publish it.
+      - name: Re-pack without compiling, and check it is the verified crate
+        if: steps.state.outputs.published == 'false'
+        run: |
+          set -euo pipefail
+          # --no-verify: no build, so no dependency code runs in this job.
+          cargo package --locked --no-verify
+          got="$(sha256sum "$CRATE" | cut -d' ' -f1)"
+          [ "$got" = "$VERIFIED" ] || { echo "::error::re-packed crate $got differs from the verified $VERIFIED"; exit 1; }
+      - name: Authenticate to crates.io (Trusted Publishing)
+        if: steps.state.outputs.published == 'false' && steps.state.outputs.first == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: cargo publish
+        if: steps.state.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.state.outputs.first == 'true' && secrets.CRATES_IO_FIRST_PUBLISH_TOKEN || steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          [ -n "$CARGO_REGISTRY_TOKEN" ] || { echo "::error::no crates.io token: for the first publish, set the crates-io environment secret CRATES_IO_FIRST_PUBLISH_TOKEN"; exit 1; }
+          cargo publish --locked --no-verify # verified in `build`, and re-checked above
+      - name: crates.io holds exactly the verified crate
+        if: steps.state.outputs.published == 'false'
+        run: |
+          set -euo pipefail
+          sum=""
+          for _ in $(seq 1 30); do
+            # `|| true`: a network error or a non-JSON error page is a retry, not a failure.
+            sum="$(curl -s --max-time 20 -A "$UA" "https://crates.io/api/v1/crates/calamus/$VERSION" | jq -r '.version.checksum // empty' 2>/dev/null || true)"
+            [ -n "$sum" ] && break
+            sleep 10
+          done
+          [ "$sum" = "$VERIFIED" ] || { echo "::error::crates.io has checksum '${sum:-none}' for $VERSION, not the verified $VERIFIED"; exit 1; }
+          echo "crates.io checksum matches the verified crate: $sum"
+
+      # Already published (a rerun): crates.io's own .crate is the truth. A
+      # rebuild under a newer cargo may not reproduce its bytes, so take the
+      # published file and check it against crates.io's recorded checksum.
+      - name: Take the published crate from crates.io
+        if: steps.state.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p target/package
+          curl -sSfL --max-time 60 --retry 3 -A "$UA" "https://static.crates.io/crates/calamus/calamus-${VERSION}.crate" -o "$CRATE"
+          want="$(jq -r '.version.checksum' "$RUNNER_TEMP/version.json")"
+          got="$(sha256sum "$CRATE" | cut -d' ' -f1)"
+          [ "$got" = "$want" ] || { echo "::error::the downloaded crate $got does not match crates.io's checksum $want"; exit 1; }
+          [ "$got" = "$VERIFIED" ] || echo "::notice::this run's rebuild ($VERIFIED) differs from the published crate ($got); releasing the published one"
+
+      - name: Attest the .crate's build provenance
+        # After the publish, and only for the bytes crates.io holds.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ env.CRATE }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: published-crate
+          path: ${{ env.CRATE }}
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: published-crate # the bytes crates.io holds
+          path: dist
+      - name: Create the release from the CHANGELOG section
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          crate="dist/calamus-${VERSION}.crate"
+          [ -f "$crate" ] || { echo "::error::$crate missing from the artifact"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::notice::$TAG already has a release; leaving it"; exit 0
+          fi
+          scripts/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
+          {
+            echo
+            echo "**Crate:** [calamus $VERSION](https://crates.io/crates/calamus/$VERSION) · [docs](https://docs.rs/calamus/$VERSION)"
+            echo
+            echo "Verify the attached \`.crate\` came from this workflow: \`gh attestation verify calamus-$VERSION.crate --repo $GITHUB_REPOSITORY\`"
+          } >> "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$crate" --repo "$GITHUB_REPOSITORY" \
+            --title "calamus $VERSION" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag

@@ -1,0 +1,28 @@
+name: Dependency review
+# Flags a pull request that adds a dependency with a known vulnerability.
+# Advisory: cargo-deny (licenses, bans, sources) and cargo-audit in CI are the
+# gates. On pull requests from forks the token is read-only, so the summary
+# comment is skipped there; the check itself still runs.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # the summary comment
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

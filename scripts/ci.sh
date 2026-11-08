@@ -26,9 +26,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --no-default-features --locked
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
-# And with default features: a link to a feature-gated item breaks only there.
+# And with default features, and with none: a link to a feature-gated item
+# breaks only where the feature is off.
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features --locked
 scripts/release-graph-check.sh
-cargo deny check bans licenses sources
-cargo audit -D warnings
+scripts/test-release-notes.sh
+# CI runs these two as their own required checks (`cargo deny`, `cargo audit`),
+# so its Rust job sets CALAMUS_CI_SPLIT=1; locally, the gate runs everything.
+if [ "${CALAMUS_CI_SPLIT:-}" != 1 ]; then
+  cargo deny check bans licenses sources
+  cargo audit -D warnings
+fi
 echo "ci: all green"

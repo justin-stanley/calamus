@@ -10,7 +10,7 @@
 //! whose `/.well-known/atproto-did` returns 404 and which resolves by TXT
 //! alone, so an HTTP-first implementation simply fails on it.
 //!
-//! **DNS goes through a seam, [`DnsResolver`].** [`SystemResolver`] (the default
+//! **DNS goes through a seam, [`DnsResolver`].** `SystemResolver` (the default
 //! `dns` feature) is hickory with the host's own configuration;
 //! `calamus::testing::StaticDns` is a fake for tests, so nothing in the default
 //! test run touches the network.

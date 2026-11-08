@@ -1,6 +1,128 @@
-//! calamus: an atproto OAuth client library, extracted from FeatherReader.
+//! An [atproto](https://atproto.com) OAuth client, for apps that sign people in
+//! with their atproto identity (Bluesky or any PDS).
 //!
-//! See `design/EXTRACTION-PLAN.md` for what each module is and the order they arrive in.
+//! calamus does the whole client side of the
+//! [atproto OAuth profile](https://atproto.com/specs/oauth):
+//!
+//! - **identity**: handle → DID (DNS TXT or `/.well-known/atproto-did`, then
+//!   verified back), DID → PDS, for `did:plc` and `did:web`;
+//! - **discovery** of the PDS's authorization server, with the issuer checks
+//!   that stop a server from claiming another's accounts;
+//! - **PAR + PKCE (S256) + DPoP**, with server nonces handled;
+//! - **`private_key_jwt`** client authentication for confidential clients, or
+//!   none for the localhost development client;
+//! - the **callback**: `state`, RFC 9207 `iss`, the browser-binding check, the
+//!   code exchange, and the token response's `sub` checked against the DID the
+//!   login started from;
+//! - **sessions**: refresh with single-use rotating refresh tokens, serialized
+//!   per account, and **revocation** (RFC 7009) on sign-out;
+//! - **XRPC calls** to the user's PDS with DPoP-bound tokens (feature `xrpc`).
+//!
+//! Every one of those steps fetches a URL someone else chose, so every request
+//! goes through [`net::Fetcher`], an **SSRF-guarded HTTP client**: it refuses
+//! private, loopback, link-local and other non-public addresses after DNS
+//! resolution and on every redirect hop, caps bodies and timeouts, and never
+//! forwards credentials across origins.
+//!
+//! It runs in production in [FeatherReader](https://github.com/justin-stanley/feather-reader),
+//! an atproto-native feed reader, where it was written before being extracted
+//! here.
+//!
+//! # Signing someone in
+//!
+//! ```no_run
+//! # #[cfg(feature = "dns")]
+//! # async fn example(now: i64, callback: calamus::flow::CallbackParams, cookie: &str) -> anyhow::Result<()> {
+//! use calamus::keys::SigningKey;
+//! use calamus::login::{Client, Deps};
+//! use calamus::metadata::{ClientMetadata, Jwks};
+//! use calamus::net::{FetchPolicy, Fetcher};
+//! use calamus::resolve::SystemResolver; // feature `dns` (default)
+//! use calamus::store::memory::{MemoryNonces, MemoryPendingLogins, MemorySessions};
+//! use url::Url;
+//!
+//! // Once, at startup. Persist the key: it is the client's identity.
+//! let key = SigningKey::generate("my-app-1");
+//! let metadata = ClientMetadata::confidential(
+//!     Url::parse("https://app.example/oauth/client-metadata.json")?,
+//!     vec![Url::parse("https://app.example/oauth/callback")?],
+//!     "atproto transition:generic",
+//!     "My App",
+//!     None,
+//!     Jwks::Inline(key.jwks_document()?),
+//! )?;
+//! let client = Client::new(metadata, Some(key), "https://plc.directory")?;
+//! let fetcher = Fetcher::new(FetchPolicy::default())?;
+//! let dns = SystemResolver::from_system_config()?;
+//! // In-memory stores, for one process; implement the `store` traits on your
+//! // database to survive restarts and run more than one instance.
+//! let (pending, sessions, nonces) =
+//!     (MemoryPendingLogins::new(), MemorySessions::new(), MemoryNonces::new());
+//! let deps = Deps { fetcher: &fetcher, dns: &dns, pending: &pending, sessions: &sessions, nonces: &nonces };
+//!
+//! // The user submits their handle: send the browser to `authorize_url` and set
+//! // `binding_token` as a cookie.
+//! let started = client.start(&deps, "alice.bsky.social", now).await?;
+//!
+//! // The authorization server redirects back to your callback with these
+//! // query parameters; the browser presents the cookie.
+//! let login = client.complete(&deps, &callback, Some(cookie), now).await?;
+//! println!("signed in as {}", login.did);
+//! # let _ = started; Ok(()) }
+//! ```
+//!
+//! A complete flow, including refresh and sign-out, runs offline in
+//! `examples/sign_in.rs` against `testing::fake` (feature `test-util`).
+//!
+//! # Wiring it into a web app
+//!
+//! If your pages send a `Content-Security-Policy` with `form-action 'self'`,
+//! don't answer the sign-in form's POST with a redirect to `authorize_url`:
+//! browsers apply `form-action` to the redirect too, and Chrome and Safari
+//! refuse it silently, so the sign-in button appears to do nothing. Answer with
+//! a page that continues with `<meta http-equiv="refresh">` and a link instead.
+//! FeatherReader hit this and fixed it that way.
+//!
+//! # Modules
+//!
+//! | module | what it does |
+//! |---|---|
+//! | [`login`] | [`login::Client`]: start and complete a login |
+//! | [`session`] | keep a session valid, refreshing it when stale |
+//! | [`revoke`] | revoke tokens; `revoke::sign_out` with feature `revoke` |
+//! | `xrpc` | DPoP-bound calls to the user's PDS (feature `xrpc`) |
+//! | [`store`] | the storage traits you implement, and in-memory versions |
+//! | [`metadata`] | the client-metadata document you publish |
+//! | [`keys`] | the client's ES256 signing key and its JWKS |
+//! | [`resolve`], [`identity`] | handle and DID resolution |
+//! | [`discovery`] | finding and checking the authorization server |
+//! | [`net`] | the SSRF-guarded fetcher |
+//! | [`dpop`], [`client_auth`], [`flow`], [`token`], [`jwt`], [`request`], [`fetch`] | the protocol pieces the above are built from |
+//! | [`error`] | [`Error`], the typed decisions a caller can match on |
+//!
+//! # Features
+//!
+//! | feature | default | adds |
+//! |---|---|---|
+//! | `dns` | yes | `resolve::SystemResolver`: handle lookup by DNS TXT through the system resolver |
+//! | `revoke` | no | `revoke::sign_out` and `sign_out_with` (the RFC 7009 request itself is always built) |
+//! | `xrpc` | no | `xrpc::Repo`: DPoP-bound XRPC calls |
+//! | `test-util` | no | `testing`: the fake authorization server, PDS, PLC and DNS, `testing::store_contract` (the rules a store must keep), and `client_auth::record_evidence`. **Only ever in `[dev-dependencies]`**: it can bypass the SSRF guard for named hosts |
+//!
+//! # Time
+//!
+//! Functions take the time as `now` (Unix seconds) rather than reading a clock,
+//! so tests can pin it.
+
+// docs.rs builds with every feature and `--cfg docsrs`: label each item with the
+// feature it needs.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/calamus-icon.svg"
+)]
+#![doc(
+    html_favicon_url = "https://raw.githubusercontent.com/justin-stanley/calamus/main/assets/favicon.svg"
+)]
 
 pub mod error;
 pub mod identity;

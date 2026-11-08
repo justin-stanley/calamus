@@ -1,0 +1,71 @@
+name: Daily audit
+# RustSec advisories arrive without a commit, so a gate that runs only on push
+# and pull requests notices them only when someone next opens one. On
+# 2026-10-25 three arrived together and FeatherReader's CI was red on every PR
+# for days before anyone looked. This runs `cargo audit` on `main` every day
+# and keeps one open issue in step with the findings: opened or updated while
+# there are any, closed when there are none.
+
+on:
+  schedule:
+    - cron: "41 6 * * *" # daily, 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit on main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # open, update or close the tracking issue
+    env:
+      CARGO_AUDIT_VERSION: 0.22.2
+      TITLE: "cargo audit: RustSec advisories affect main"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2
+        with:
+          tool: cargo-audit@${{ env.CARGO_AUDIT_VERSION }}
+      - name: cargo audit
+        id: audit
+        run: |
+          set +e
+          cargo audit -D warnings --color never > "$RUNNER_TEMP/audit.txt" 2>&1
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/audit.txt"
+      - name: Keep the tracking issue in step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.audit.outputs.status }}
+        run: |
+          set -euo pipefail
+          # Create the label first: listing by a label that doesn't exist fails.
+          gh label create security --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Security-relevant" 2>/dev/null || true
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label security \
+            --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')"
+          if [ "$STATUS" = 0 ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --repo "$GITHUB_REPOSITORY" \
+                --comment "\`cargo audit\` is clean on \`main\` as of $(date -u +%F). Closing."
+            fi
+            exit 0
+          fi
+          # The backticks are Markdown for the issue, not a command substitution.
+          # shellcheck disable=SC2016
+          body="$(printf 'The daily audit of `main` failed on %s.\n\n~~~text\n%s\n~~~\n\nFix it in a pull request; this issue closes by itself once `main` is clean.\n' \
+            "$(date -u +%F)" "$(tail -c 60000 "$RUNNER_TEMP/audit.txt")")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label security --body "$body"
+          fi
+          exit 1
