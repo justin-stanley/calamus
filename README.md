@@ -40,8 +40,9 @@ Every one of those steps fetches a URL that someone else chose, so every request
 addresses after DNS resolution and on every redirect hop, caps bodies and timeouts, and never
 forwards credentials across origins.
 
-calamus runs in production in [FeatherReader](https://github.com/justin-stanley/feather-reader),
-an atproto-native feed reader, where it was written and from which it was extracted.
+calamus was extracted from the OAuth code of [FeatherReader](https://github.com/justin-stanley/feather-reader),
+an atproto-native feed reader, where that code runs in production. FeatherReader has not yet
+switched to the crate itself.
 
 > **Status: pre-release.** The code is complete and tested, but calamus is not on crates.io yet.
 > It will be published as 0.1.0 once FeatherReader has switched to it. Until then, depend on
